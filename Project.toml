@@ -1,0 +1,7 @@
+[deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+FASTX = "c2308a5c-f048-11e8-3e8a-31650f418d12"
+Parquet = "626c502c-15b0-58ad-a749-f091afb673ae"
+XAM = "d759349c-bcba-11e9-07c2-5b90f8f05f7c"
