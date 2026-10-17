@@ -2,7 +2,7 @@
 
 julia_version = "1.13.2"
 manifest_format = "2.1"
-project_hash = "9f6565a57696bf30db0e1fd08decbc9b52e577f0"
+project_hash = "f80144876f00b7749242b83da84c215bc3c1d853"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -94,6 +94,12 @@ registries = "General"
 uuid = "27a7e980-b3e6-11e9-2bcd-0b925532e340"
 version = "0.4.2"
 
+[[deps.ArgCheck]]
+git-tree-sha1 = "f9e9a66c9b7be1ad7372bbd9b062d9230c30c5ce"
+registries = "General"
+uuid = "dce04be8-c92d-5529-be00-80e4d2c0e197"
+version = "2.5.0"
+
 [[deps.ArgParse]]
 deps = ["Logging", "TextWrap"]
 git-tree-sha1 = "22cf435ac22956a7b45b0168abbc871176e7eecc"
@@ -173,6 +179,20 @@ git-tree-sha1 = "41e42d326ff01d12167f3f8a218b318bf7429d0f"
 registries = "General"
 uuid = "3c28c6f8-a34d-59c4-9654-267d177fcfa9"
 version = "5.2.0"
+
+[[deps.Blosc]]
+deps = ["Blosc_jll"]
+git-tree-sha1 = "310b77648d38c223d947ff3f50f511d08690b8d5"
+registries = "General"
+uuid = "a74b3585-a348-5f62-a45c-50e91977d574"
+version = "0.7.3"
+
+[[deps.Blosc_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Lz4_jll", "Zlib_jll", "Zstd_jll"]
+git-tree-sha1 = "535c80f1c0847a4c967ea945fca21becc9de1522"
+registries = "General"
+uuid = "0b7ba130-8d10-5ba8-a3d6-c5182647fed9"
+version = "1.21.7+0"
 
 [[deps.Bzip2_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -276,6 +296,33 @@ weakdeps = ["SparseArrays"]
 
     [deps.ChainRulesCore.extensions]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
+
+[[deps.ChunkCodecCore]]
+git-tree-sha1 = "3496e2b359c27793d12bec54ec94be7983a6ceb2"
+registries = "General"
+uuid = "0b6fb165-00bc-4d37-ab8b-79f91016dbe1"
+version = "1.0.2"
+
+[[deps.ChunkCodecLibZlib]]
+deps = ["ChunkCodecCore", "Zlib_jll"]
+git-tree-sha1 = "d4101e848e8d3f585d61d244c2fe0c80a70e6b3b"
+registries = "General"
+uuid = "4c0bbee4-addc-4d73-81a0-b6caacae83c8"
+version = "1.1.0"
+
+[[deps.ChunkCodecLibZstd]]
+deps = ["ChunkCodecCore", "Zstd_jll"]
+git-tree-sha1 = "34d9873079e4cb3d0c62926a225136824677073f"
+registries = "General"
+uuid = "55437552-ac27-4d47-9aa3-63184e8fd398"
+version = "1.0.0"
+
+[[deps.CodecInflate64]]
+deps = ["TranscodingStreams"]
+git-tree-sha1 = "d981a6e8656b1e363a2731716f46851a2257deb7"
+registries = "General"
+uuid = "6309b1aa-fc58-479c-8956-599a07234577"
+version = "0.1.3"
 
 [[deps.CodecZlib]]
 deps = ["TranscodingStreams", "Zlib_jll"]
@@ -444,6 +491,13 @@ registries = "General"
 uuid = "e2d170a0-9d28-54be-80f0-106bbe20a464"
 version = "1.0.0"
 
+[[deps.DateTimes64]]
+deps = ["Dates"]
+git-tree-sha1 = "1db3d38eecf7c197f5839d2afd6aedb15a8753b3"
+registries = "General"
+uuid = "b342263e-b350-472a-b1a9-8dfd21b51589"
+version = "1.0.1"
+
 [[deps.Dates]]
 deps = ["Printf"]
 uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
@@ -461,6 +515,13 @@ git-tree-sha1 = "4ac548adcad90c1d5d677af13568a748af4c952b"
 registries = "General"
 uuid = "927a84f5-c5f4-47a5-9785-b46e178433df"
 version = "1.6.7"
+
+[[deps.DiskArrays]]
+deps = ["ConstructionBase", "LRUCache", "Mmap", "OffsetArrays"]
+git-tree-sha1 = "49bd7d5b2c773a078b076f0d491c9c30b4715586"
+registries = "General"
+uuid = "3c3547ce-8d99-4f5e-a174-61eb10b00ae3"
+version = "0.4.25"
 
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
@@ -595,12 +656,10 @@ git-tree-sha1 = "6621fef488e496356c9c9625d0562c12a6070819"
 registries = "General"
 uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 version = "1.20.0"
+weakdeps = ["HTTP"]
 
     [deps.FileIO.extensions]
     HTTPExt = "HTTP"
-
-    [deps.FileIO.weakdeps]
-    HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 
 [[deps.FilePaths]]
 deps = ["FilePathsBase", "MacroTools", "Reexport"]
@@ -775,6 +834,13 @@ registries = "General"
 uuid = "3955a311-db13-416c-9275-1d80ed98e5e9"
 version = "0.11.3"
 
+[[deps.HTTP]]
+deps = ["Base64", "CodecZlib", "Dates", "EnumX", "Logging", "PrecompileTools", "Random", "Reseau", "SHA", "URIs", "UUIDs", "Zlib_jll"]
+git-tree-sha1 = "ed18c529d170d8431c9d91537520b6d3dec052ca"
+registries = "General"
+uuid = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+version = "2.9.0"
+
 [[deps.HarfBuzz_jll]]
 deps = ["Artifacts", "Cairo_jll", "Fontconfig_jll", "FreeType2_jll", "Glib_jll", "Graphite2_jll", "JLLWrappers", "Libdl", "Libffi_jll"]
 git-tree-sha1 = "9d9531a9cb63a9edc33836414e82a07e81710de2"
@@ -875,6 +941,12 @@ version = "1.4.6"
     [deps.InlineStrings.weakdeps]
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
     Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
+
+[[deps.InputBuffers]]
+git-tree-sha1 = "e5392ea00942566b631e991dd896942189937b2f"
+registries = "General"
+uuid = "0c81fc1b-5583-44fc-8770-48be1e1cca08"
+version = "1.1.1"
 
 [[deps.IntegerMathUtils]]
 git-tree-sha1 = "c72458f1962faeb003bf23cbdb75164fe6280906"
@@ -1064,6 +1136,16 @@ registries = "General"
 uuid = "1d63c593-3942-5779-bab2-d838dc0a180e"
 version = "23.1.1+0"
 
+[[deps.LRUCache]]
+git-tree-sha1 = "5519b95a490ff5fe629c4a7aa3b3dfc9160498b3"
+registries = "General"
+uuid = "8ac3fa9e-de4c-5943-b1dc-09c6b5f20637"
+version = "1.6.2"
+weakdeps = ["Serialization"]
+
+    [deps.LRUCache.extensions]
+    SerializationExt = ["Serialization"]
+
 [[deps.LaTeXStrings]]
 git-tree-sha1 = "f88f3ccef05a6a72a0cf0ed417c8fd68530f4ab2"
 registries = "General"
@@ -1179,6 +1261,13 @@ version = "1.0.2"
 [[deps.Logging]]
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
+
+[[deps.Lz4_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "191686b1ac1ea9c89fc52e996ad15d1d241d1e33"
+registries = "General"
+uuid = "5ced341a-0733-55b8-9ab6-a4889d929147"
+version = "1.10.1+0"
 
 [[deps.MacroTools]]
 git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
@@ -1574,6 +1663,13 @@ registries = "General"
 uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.3.1"
 
+[[deps.Reseau]]
+deps = ["NetworkOptions", "OpenSSL_jll", "PrecompileTools", "Random", "SHA"]
+git-tree-sha1 = "3c8cb8ecab28eec47a02d56a44d4929b85fbab55"
+registries = "General"
+uuid = "802f3686-a58f-41ce-bb0c-3c43c75bba36"
+version = "1.6.0"
+
 [[deps.Rmath]]
 deps = ["Random", "Rmath_jll"]
 git-tree-sha1 = "5b3d50eb374cea306873b371d3f8d3915a018f0b"
@@ -1927,13 +2023,20 @@ registries = "General"
 uuid = "7200193e-83a8-5a55-b20d-5d36d44a0795"
 version = "1.1.2"
 
+[[deps.URIs]]
+deps = ["Serialization"]
+git-tree-sha1 = "0392e5e3c5327b90a487b0ff3e818c4aecd3660b"
+registries = "General"
+uuid = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
+version = "1.7.1"
+
 [[deps.UUIDs]]
 deps = ["Random", "SHA"]
 uuid = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 version = "1.11.0"
 
 [[deps.UniMap]]
-deps = ["ArgParse", "CSV", "CairoMakie", "CodecZlib", "DataFrames", "Dates", "FASTX", "Parquet", "SHA", "TOML", "XAM"]
+deps = ["ArgParse", "CSV", "CairoMakie", "CodecZlib", "DataFrames", "Dates", "FASTX", "Parquet", "SHA", "TOML", "XAM", "Zarr"]
 path = "."
 uuid = "aa3ede93-871e-47c9-818b-a05189d0a35d"
 version = "0.1.0"
@@ -2063,6 +2166,82 @@ git-tree-sha1 = "a63799ff68005991f9d9491b6e95bd3478d783cb"
 registries = "General"
 uuid = "c5fb5394-a638-5e4d-96e5-b29de1b5cf10"
 version = "1.6.0+0"
+
+[[deps.Zarr]]
+deps = ["Preferences", "ZarrBlosc", "ZarrCore", "ZarrGCS", "ZarrHTTP", "ZarrS3", "ZarrZip", "ZarrZlib", "ZarrZstd"]
+git-tree-sha1 = "d7c278d84c8a579c8d6eb8ca860cf693e8922110"
+registries = "General"
+uuid = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
+version = "0.11.1"
+
+[[deps.ZarrBlosc]]
+deps = ["Blosc", "JSON", "ZarrCore"]
+git-tree-sha1 = "df7a8e2ec009ab24ac628c3f243c816d7577ee3b"
+registries = "General"
+uuid = "5717d1f5-dd42-40cd-8e77-00dfad1079f5"
+version = "0.11.0"
+
+[[deps.ZarrCore]]
+deps = ["CRC32c", "DateTimes64", "Dates", "DiskArrays", "JSON", "OrderedCollections", "Preferences", "Unicode"]
+git-tree-sha1 = "980b102cd6d80338b9d0b1c32e3abbc293280689"
+registries = "General"
+uuid = "77f5b75c-4c08-499f-ba13-550b0a0af171"
+version = "0.11.1"
+
+[[deps.ZarrGCS]]
+deps = ["HTTP", "JSON", "URIs", "ZarrCore"]
+git-tree-sha1 = "6ec6917a515d9b0ded019da6a690b2ed75bcb281"
+registries = "General"
+uuid = "b0c5ce8f-018f-417d-9deb-9816b6363039"
+version = "0.11.0"
+
+[[deps.ZarrHTTP]]
+deps = ["HTTP", "ZarrCore"]
+git-tree-sha1 = "a73476fba804b1bca09f9c3a7b30119b501bc533"
+registries = "General"
+uuid = "904a97b2-8abf-4ac8-b211-6540db5c2c8c"
+version = "0.11.1"
+
+[[deps.ZarrS3]]
+deps = ["ZarrCore"]
+git-tree-sha1 = "ae5d7b010e1af56e9530f99db9b0a30816e7011c"
+registries = "General"
+uuid = "3ac672aa-0e94-41ce-be0d-2f83c20261dd"
+version = "0.11.0"
+
+    [deps.ZarrS3.extensions]
+    ZarrS3AWSS3Ext = "AWSS3"
+
+    [deps.ZarrS3.weakdeps]
+    AWSS3 = "1c724243-ef5b-51ab-93f4-b0a88ac62a95"
+
+[[deps.ZarrZip]]
+deps = ["ZarrCore", "ZipArchives"]
+git-tree-sha1 = "824831177f4233a9738d1a760c1c7f8ddff7df1b"
+registries = "General"
+uuid = "54bcf1c8-e61d-4e4f-b375-463581846cca"
+version = "0.11.0"
+
+[[deps.ZarrZlib]]
+deps = ["ChunkCodecCore", "ChunkCodecLibZlib", "JSON", "ZarrCore"]
+git-tree-sha1 = "169ada3f24f2b918fe329f6a3d754d9a66badfe4"
+registries = "General"
+uuid = "5ee7c756-6ac8-46ad-a53f-994846513443"
+version = "0.11.0"
+
+[[deps.ZarrZstd]]
+deps = ["ChunkCodecCore", "ChunkCodecLibZstd", "JSON", "ZarrCore"]
+git-tree-sha1 = "53c98b9be58271a2e5cdb3a9805800828cc1b6df"
+registries = "General"
+uuid = "1a1ab68b-db27-4b87-8dee-6752e2bcfa1e"
+version = "0.11.0"
+
+[[deps.ZipArchives]]
+deps = ["ArgCheck", "CodecInflate64", "CodecZlib", "InputBuffers", "PrecompileTools", "TranscodingStreams", "Zlib_jll"]
+git-tree-sha1 = "3e6acd912522133953125645b263934ae2ac745e"
+registries = "General"
+uuid = "49080126-0e18-4c2a-b176-c102e4b3760c"
+version = "2.6.1"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]

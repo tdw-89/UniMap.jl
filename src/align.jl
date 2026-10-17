@@ -23,14 +23,14 @@ end
 Write `simdir/align.sh`, a bash script that aligns the simulated pairs for
 each read length with one bowtie2 run per L, producing unsorted, unfiltered
 `aln/sim_L{L}.bam`. `aligner_args` should be the production arguments; `-X` is set to
-the simulation's `fmax` if absent. Also writes `align.toml` recording the settings.
+the largest simulated fragment length if absent. Also writes `align.toml` recording the settings.
 """
 function write_align_script(simdir::AbstractString; index::AbstractString, threads::Integer=4,
                             aligner_args::AbstractString="", bowtie2::AbstractString="bowtie2",
                             samtools::AbstractString="samtools")
     out = joinpath(simdir, "align.sh")
     meta = read_simulate_toml(simdir)
-    fmax = meta["grid"]["fmax"]
+    fmax = maximum(meta["grid"]["fragment_lengths"])
     Ls = meta["grid"]["read_lengths"]
     args = Base.shell_split(aligner_args)
     any(a -> a in ("--no-unal", "-p", "--threads", "-x", "-1", "-2", "-U", "-S"), args) &&
@@ -39,7 +39,7 @@ function write_align_script(simdir::AbstractString; index::AbstractString, threa
     if X === nothing
         append!(args, ["-X", string(fmax)])
     elseif X != fmax
-        @warn "aligner -X $X differs from the simulation fmax $fmax; fragment lengths above $X cannot align as proper pairs"
+        @warn "aligner -X $X differs from the largest simulated fragment length $fmax; fragments longer than $X cannot align as proper pairs"
     end
     isfile(index * ".1.bt2") || isfile(index * ".1.bt2l") ||
         @warn "no bowtie2 index found at prefix $index (fine if the script will run elsewhere)"

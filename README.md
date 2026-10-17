@@ -43,7 +43,8 @@ examples below use `unimap` as shorthand.
 unimap loci -f ref.fa -a annotation.gff -g genes.txt -o loci.tsv
 
 # 2. Simulate read pairs (gzipped FASTQ, one pair of files per locus and read length)
-unimap simulate -f ref.fa -l loci.tsv -o sim/ -L 50,100,150 --fmax 500
+unimap simulate -f ref.fa -l loci.tsv -o sim/ -L 50,100,150 -F 100,150,200,250,300,400,500 \
+    --step 5 --orientation plus
 
 # 3. Write the alignment script, then run it (locally or inside a batch job)
 unimap align-script -s sim/ -x ref_bt2_index -t 8 --aligner-args='--very-sensitive'
@@ -53,7 +54,8 @@ bash sim/align.sh
 unimap score -s sim/
 ```
 
-Results are written to `sim/scores/` as Parquet files. Every command takes `--help`.
+Results are written to `sim/scores/`: per-base tracks in a Zarr store and summary tables
+in Parquet. Every command takes `--help`.
 
 ## How it works
 
@@ -66,7 +68,11 @@ A fragment of length F starting at position `s` gives two mates of length `m = m
 | `+` | first `m` bases (forward strand) | reverse complement of the last `m` bases |
 | `-` | reverse complement of the last `m` bases | first `m` bases |
 
-- **Both orientations** are simulated at every start position.
+- **Orientation**: `--orientation both` simulates both `+` and `-` at every start
+  position. `plus` or `minus` simulates only one, which halves the read count. The two
+  orientations are the same two sequences with the mates swapped. On the zebrafish test
+  loci, one-orientation tracks matched each other to a mean per-base difference of
+  ≤ 0.0005 at MAPQ ≥ 2.
 - When F < L, both mates are trimmed to F, which mirrors adapter trimming.
 - All bases get a uniform quality (`I` by default, i.e. Q40).
 - Fragments with a non-ACGT base in either mate are skipped and excluded from the
@@ -76,15 +82,23 @@ A fragment of length F starting at position `s` gives two mates of length `m = m
 
 ### Grid
 
-- **Read lengths**: `-L`, default `36,50,75,100,150`.
-- **Fragment lengths**: start at `--fmin` (default 50). The step starts at 1 and doubles
-  every two steps, and `--fmax` is always included:
-  `50, 51, 52, 54, 56, 60, 64, 72, 80, 96, 112, 144, 176, 240, 304, 432, 500`.
-  **Set `--fmax` to the aligner's maximum fragment length (bowtie2 `-X`).** Longer
-  fragments can never align as proper pairs.
-- **Tiling step**: `--step-policy`, default `150:1,300:2,*:5`. This means step 1 for
-  F ≤ 150, step 2 for F ≤ 300, and step 5 above that. A larger step lowers the
-  denominator but not the expected score.
+Read lengths (`-L`) and fragment lengths (`-F`) are both explicit lists with no defaults.
+
+- **Read lengths**: the lengths your runs round down to, usually their 10th–25th
+  percentile post-trimming read length. Each read length is a separate bowtie2 run, so
+  list only the ones you need.
+- **Fragment lengths**: points spanning your runs' fragment-length histograms. They are
+  later used to interpolate each run's histogram. The largest should equal the aligner's
+  maximum fragment length (bowtie2 `-X`), because longer fragments can never align as
+  proper pairs. All fragment lengths go into the same FASTQ files and bowtie2 run, so
+  each one adds reads but not alignment runs.
+- **Tiling step** (`--step`, default 1): bp between consecutive fragment starts.
+  - Pairs simulated per base per read length = (number of fragment lengths) ×
+    (orientations) / step.
+  - The fragments covering a base = F × (orientations) / step.
+  - A larger step coarsens the per-base average but doesn't bias it. Keep it well below
+    the shortest read length (≤ L/5 is a safe rule), so every mate-length stretch of
+    sequence is still sampled several times.
 
 ### Loci
 
@@ -139,9 +153,10 @@ equally good hits.
 | `-f/--fasta` | required | must be the FASTA the aligner index was built from |
 | `-l/--loci` | | `loci.tsv` or `.bed`; or use `-a` and `-g` (plus flank options) instead |
 | `-o/--out` | required | output directory |
-| `-L/--read-lengths` | `36,50,75,100,150` | |
-| `--fmin`, `--fmax` | 50, 500 | |
-| `--step-policy` | `150:1,300:2,*:5` | |
+| `-L/--read-lengths` | required | comma-separated, e.g. `50,100,150` |
+| `-F/--fragment-lengths` | required | comma-separated, e.g. `100,150,200,300,500` |
+| `--step` | 1 | bp between fragment starts |
+| `--orientation` | `both` | `both`, `plus` or `minus` |
 | `--qual` | `I` | |
 | `--no-checksum` | | skip the SHA-256 of the FASTA |
 
@@ -153,7 +168,7 @@ Threads over loci (`julia -t N`).
 | `-s/--sim` | required | `simulate` output directory |
 | `-x/--index` | required | bowtie2 index prefix |
 | `-t/--threads` | 4 | |
-| `--aligner-args` | `''` | production bowtie2 arguments. Use the `=` form: `--aligner-args='--very-sensitive -X 500'`. `-X` is set to `fmax` if missing. |
+| `--aligner-args` | `''` | production bowtie2 arguments. Use the `=` form: `--aligner-args='--very-sensitive -X 500'`. `-X` is set to the largest fragment length if missing. |
 | `--bowtie2`, `--samtools` | on `PATH` | executable paths |
 
 Writes `SIM/align.sh`, which runs one bowtie2 job per read length to produce
@@ -188,33 +203,69 @@ Threads over read lengths. Denominators are rebuilt from the reference and check
 | `align.sh`, `align.toml`, `aln/` | written by `align-script` and by running the script |
 
 **`scores/`**
-| file | one row per | key columns |
-|---|---|---|
-| `mappability_tracks.parquet` | run of constant score | `locus_id, chrom, start0, end0, L, F, mapq_cutoff, score, min_denominator, genome_checksum` |
-| `misplacement_summary.parquet` | locus × L × F × cutoff, plus genome-wide `ALL` rows | `n_fragments, n_kept, n_correct_kept, n_wrong_kept, frac_wrong_kept, frac_correct, n_not_proper, n_missing, n_skipped_N, min_denominator` |
-| `bleed_matrix.parquet` | origin × destination × L × F × cutoff | `origin_locus, dest_locus` (another target locus, or `elsewhere`), `n_fragments` |
-| `misplaced_sites.parquet` | origin × 1 kb destination bin × fragment MAPQ | where wrong-locus pairs landed |
-| `score.toml` | | reference checksum, bowtie2 version and arguments, scoring settings |
+| file | contents |
+|---|---|
+| `mappability.zarr` | per-base tracks for every locus, concatenated end to end (described below) |
+| `misplacement_summary.parquet` | one row per locus × L × F × cutoff, plus genome-wide `ALL` rows: `n_fragments, n_kept, n_correct_kept, n_wrong_kept, frac_wrong_kept, frac_correct, n_not_proper, n_missing, n_skipped_N, min_denominator` |
+| `bleed_matrix.parquet` | one row per origin × destination × L × F × cutoff: `origin_locus`, `dest_locus` (another target locus, or `elsewhere`), `n_fragments`. Not written if nothing was misplaced. |
+| `misplaced_sites.parquet` | one row per origin × 1 kb destination bin × fragment MAPQ: where wrong-locus pairs landed. Not written if nothing was misplaced. |
+| `score.toml` | reference checksum, bowtie2 version and arguments, scoring settings |
 
-Reading the tables:
+### `mappability.zarr`
+
+A Zarr v2 group. All loci are concatenated along one `position` axis, and each
+(L, F, cutoff) combination is a channel.
+
+| array | Julia dims | Python/xarray dims | type |
+|---|---|---|---|
+| `score` | `[position, F, mapq_cutoff, L]` | `(L, mapq_cutoff, F, position)` | Float32, `NaN` where nothing was simulated |
+| `denominator` | `[position, F, L]` | `(L, F, position)` | UInt16, simulated fragments covering the base |
+| `L`, `F`, `mapq_cutoff` | 1-D | 1-D | grid values |
+
+- The group attributes hold `loci`: one entry per locus with `locus_id, chrom, start0,
+  end0, strand, offset`. Locus k covers positions `offset+1 : offset+(end0-start0)` in
+  Julia (`offset : offset+(end0-start0)` in Python). Position `i` within a locus is
+  genomic `start0 + i - 1`.
+- The attributes also hold `genome_checksum`, the grid and the scoring settings.
+- Chunks are 16,384 positions × all F × all cutoffs for one L, compressed with
+  Blosc/zstd. Reading one locus for one read length therefore touches only a few chunks.
+
+Reading the tracks:
+
+```julia
+using UniMap
+t = locus_track("sim/scores/mappability.zarr", "pimr158"; L=100, F=240, mapq_cutoff=2)
+t.chrom, t.start0, t.score, t.denominator   # per-base vectors
+
+using Zarr                                   # or the whole array
+z = zopen("sim/scores/mappability.zarr"; consolidated=true)
+z["score"]                                   # [position, F, mapq_cutoff, L]
+```
+```python
+import xarray as xr
+ds = xr.open_zarr("sim/scores/mappability.zarr")   # ds.score.sel(L=100, F=240, mapq_cutoff=2)
+```
+
+The summary tables are Parquet:
 
 ```julia
 using Parquet, DataFrames
-tracks = DataFrame(read_parquet("sim/scores/mappability_tracks.parquet"))
-```
-```python
-import pandas as pd
-tracks = pd.read_parquet("sim/scores/mappability_tracks.parquet")
+summary = DataFrame(read_parquet("sim/scores/misplacement_summary.parquet"))
 ```
 
 ## Scale
 
-On 14 zebrafish loci of about 6–27 kb each (gene plus flanks), with the default F grid:
+On 14 zebrafish loci of about 6–27 kb each (gene plus flanks), with 17 fragment lengths
+(50–500 bp), both orientations and steps of 1–5 bp:
 
-- Simulation: about 400k pairs per locus per read length, about 7 MB of FASTQ per locus
-  per read length, and about 13 s for 3 read lengths on 8 threads.
-- Alignment dominates the runtime: bowtie2 handled about 2.1M pairs in 2.3 min on 8
-  threads against the whole genome.
+- Simulation: about 27 pairs per base per read length, about 400k pairs per locus per
+  read length, about 7 MB of FASTQ per locus per read length, and about 13 s for 3 read
+  lengths on 8 threads.
+- Alignment dominates the runtime: bowtie2 took 7–14 min per read length (about 5.6M
+  pairs) on 8 threads against the whole genome.
+- Scoring all three read lengths took 17 s, and `mappability.zarr` is 12 MB.
+- The quick-start settings (7 fragment lengths, `--step 5`, one orientation) give
+  1.4 pairs per base per read length, about 20× fewer reads.
 
 ## Tests
 

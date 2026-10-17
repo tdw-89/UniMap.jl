@@ -11,7 +11,7 @@ isacgt(b::UInt8) = b == UInt8('A') || b == UInt8('C') || b == UInt8('G') || b ==
     fragment_starts(locus, F, step, chromlen) -> StepRange
 
 0-based starts of every simulated fragment of length `F` that overlaps the scored
-region of `locus`. Equivalent to tiling the locus padded by `F - 1` (≤ `F_max`) on each side.
+region of `locus`, every `step` bp. Equivalent to tiling the locus padded by `F - 1` on each side.
 """
 fragment_starts(locus::Locus, F::Integer, step::Integer, chromlen::Integer) =
     max(0, locus.start0 - F + 1):step:min(locus.end0 - 1, chromlen - F)
@@ -81,21 +81,20 @@ struct TileSummary
 end
 
 """
-    tile_locus!(io1, io2, locus, seq, region_start0, chromlen, L, Fs, policy; qual='I')
+    tile_locus!(io1, io2, locus, seq, region_start0, chromlen, L, Fs, step; qual='I', orientations=['+', '-'])
 
-Write both orientations of every fragment (all `Fs`) for one locus and read length `L`.
-Mates are the first/last `min(L, F)` bases of the fragment (F < L mimics adapter trimming).
-`seq` holds the reference from `region_start0` (see `sim_region`).
+Write the requested orientations of every fragment (all `Fs`, starts every `step` bp) for
+one locus and read length `L`. Mates are the first/last `min(L, F)` bases of the fragment
+(F < L mimics adapter trimming). `seq` holds the reference from `region_start0` (see `sim_region`).
 """
 function tile_locus!(io1::IO, io2::IO, locus::Locus, seq::AbstractVector{UInt8}, region_start0::Integer,
-                     chromlen::Integer, L::Integer, Fs::AbstractVector{<:Integer}, policy::StepPolicy;
-                     qual::Char='I')
+                     chromlen::Integer, L::Integer, Fs::AbstractVector{<:Integer}, step::Integer;
+                     qual::Char='I', orientations::AbstractVector{Char}=['+', '-'])
     fwd = Vector{UInt8}(undef, L)
     rev = Vector{UInt8}(undef, L)
     q = fill(UInt8(qual), L)
     rows = TileSummary[]
     for F in Fs
-        step = tiling_step(policy, F)
         m = min(L, F)
         starts = fragment_starts(locus, F, step, chromlen)
         fv, rv, qv = view(fwd, 1:m), view(rev, 1:m), view(q, 1:m)
@@ -110,16 +109,15 @@ function tile_locus!(io1::IO, io2::IO, locus::Locus, seq::AbstractVector{UInt8},
             @inbounds for k in 1:m
                 rev[k] = COMPLEMENT[seq[i+F-k]+1]
             end
-            name = read_name(locus.id, locus.chrom, f0, F, '+')
-            write_fastq_record(io1, name, fv, qv)
-            write_fastq_record(io2, name, rv, qv)
-            name = read_name(locus.id, locus.chrom, f0, F, '-')
-            write_fastq_record(io1, name, rv, qv)
-            write_fastq_record(io2, name, fv, qv)
+            for o in orientations
+                name = read_name(locus.id, locus.chrom, f0, F, o)
+                write_fastq_record(io1, name, o == '+' ? fv : rv, qv)
+                write_fastq_record(io2, name, o == '+' ? rv : fv, qv)
+            end
         end
         n = length(starts)
         push!(rows, TileSummary(locus.id, L, F, step, n > 0 ? first(starts) : -1, n > 0 ? last(starts) : -1,
-                                n, nskip, 2 * (n - nskip)))
+                                n, nskip, length(orientations) * (n - nskip)))
     end
     return rows
 end
@@ -170,29 +168,31 @@ function write_tiling(path::AbstractString, rows::AbstractVector{TileSummary})
 end
 
 """
-    simulate(fa, loci, outdir; read_lengths, fmin, fmax, step_policy, qual='I', checksum=true, provenance=Dict())
+    simulate(fa, loci, outdir; read_lengths, fragment_lengths, step=1, orientation="both", qual='I', checksum=true, provenance=Dict())
 
 Phase 1 tiler. For each (locus, L) writes `fastq/L{L}/{locus}_R1.fq.gz` and `_R2.fq.gz`
-containing every F in `fragment_length_grid(fmin, fmax)`, plus `loci.tsv`, `loci.bed`,
-`tiling.tsv` and `simulate.toml` (provenance) in `outdir`. Threads over loci.
+containing every F in `fragment_lengths`, with fragment starts every `step` bp, plus
+`loci.tsv`, `loci.bed`, `tiling.tsv` and `simulate.toml` (provenance) in `outdir`.
+`orientation` is `both`, `plus` or `minus`. Threads over loci.
 """
 function simulate(fa::IndexedFasta, loci::AbstractVector{Locus}, outdir::AbstractString;
-                  read_lengths::AbstractVector{<:Integer}=[36, 50, 75, 100, 150],
-                  fmin::Integer=50, fmax::Integer=500,
-                  step_policy::StepPolicy=parse_step_policy(DEFAULT_STEP_POLICY),
+                  read_lengths::AbstractVector{<:Integer}, fragment_lengths::AbstractVector{<:Integer},
+                  step::Integer=1, orientation::AbstractString="both",
                   qual::Char='I', checksum::Bool=true, provenance::AbstractDict=Dict{String,Any}())
     isempty(loci) && error("no loci to simulate")
-    isempty(read_lengths) && error("no read lengths given")
-    all(>(0), read_lengths) || error("read lengths must be positive")
-    Fs = fragment_length_grid(fmin, fmax)
+    Ls = check_lengths("read lengths", read_lengths)
+    Fs = check_lengths("fragment lengths", fragment_lengths)
+    step >= 1 || throw(ArgumentError("step must be >= 1"))
+    orients = parse_orientation(orientation)
+    fmax = maximum(Fs)
     validate_loci(fa, loci, fmax)
 
-    for L in read_lengths
+    for L in Ls
         mkpath(joinpath(outdir, "fastq", "L$L"))
     end
     sha = checksum ? (@info("Computing SHA-256 of $(fa.path)"); file_sha256(fa.path)) : "not computed"
 
-    @info "Tiling $(length(loci)) loci" read_lengths = join(read_lengths, ",") fragment_lengths = join(Fs, ",") threads = Threads.nthreads()
+    @info "Tiling $(length(loci)) loci" read_lengths = join(Ls, ",") fragment_lengths = join(Fs, ",") step orientation threads = Threads.nthreads()
     results = Vector{Vector{TileSummary}}(undef, length(loci))
     Threads.@threads :dynamic for k in eachindex(loci)
         locus = loci[k]
@@ -200,11 +200,12 @@ function simulate(fa::IndexedFasta, loci::AbstractVector{Locus}, outdir::Abstrac
         rs, re = sim_region(locus, fmax, chromlen)
         seq = fetch_seq(fa, locus.chrom, rs, re)
         rows = TileSummary[]
-        for L in read_lengths
+        for L in Ls
             p1, p2 = fastq_paths(outdir, locus.id, L)
             with_gzip(p1) do io1
                 with_gzip(p2) do io2
-                    append!(rows, tile_locus!(io1, io2, locus, seq, rs, chromlen, L, Fs, step_policy; qual))
+                    append!(rows, tile_locus!(io1, io2, locus, seq, rs, chromlen, L, Fs, step;
+                                              qual, orientations=orients))
                 end
             end
         end
@@ -221,10 +222,9 @@ function simulate(fa::IndexedFasta, loci::AbstractVector{Locus}, outdir::Abstrac
         "unimap" => Dict("version" => string(pkgversion(@__MODULE__)), "git_commit" => git_commit(),
                          "created" => string(now()), "julia" => string(VERSION)),
         "reference" => Dict("fasta" => abspath(fa.path), "sha256" => sha),
-        "grid" => Dict("read_lengths" => collect(Int, read_lengths), "fragment_lengths" => Fs,
-                       "fmin" => fmin, "fmax" => fmax, "step_policy" => string(step_policy),
-                       "quality_char" => string(qual)),
-        "output" => Dict("n_loci" => length(loci), "n_pairs_per_L" => Dict(string(L) => sum(r.n_pairs for r in all_rows if r.L == L) for L in read_lengths),
+        "grid" => Dict("read_lengths" => Ls, "fragment_lengths" => Fs, "step" => step,
+                       "orientation" => orientation, "quality_char" => string(qual)),
+        "output" => Dict("n_loci" => length(loci), "n_pairs_per_L" => Dict(string(L) => sum(r.n_pairs for r in all_rows if r.L == L) for L in Ls),
                          "read_name_format" => "locusID|chrom|fragStart0|F|orient"),
         "provenance" => provenance,
     )

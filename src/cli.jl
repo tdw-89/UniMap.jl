@@ -30,7 +30,7 @@ function cli_settings()
             arg_type = Int
             default = 4
         "--aligner-args"
-            help = "production bowtie2 arguments as one string; use the = form, e.g. --aligner-args='--very-sensitive -X 500'. -X defaults to the simulation fmax"
+            help = "production bowtie2 arguments as one string; use the = form, e.g. --aligner-args='--very-sensitive -X 500'. -X defaults to the largest simulated fragment length"
             default = ""
         "--bowtie2"
             help = "bowtie2 executable"
@@ -109,19 +109,18 @@ function cli_settings()
             help = "output directory"
             required = true
         "--read-lengths", "-L"
-            help = "comma-separated read lengths"
-            default = "36,50,75,100,150"
-        "--fmin"
-            help = "smallest fragment length"
+            help = "comma-separated read lengths, e.g. 50,100,150"
+            required = true
+        "--fragment-lengths", "-F"
+            help = "comma-separated fragment lengths, e.g. 100,150,200,300,500; the largest should equal the aligner's max fragment length (bowtie2 -X)"
+            required = true
+        "--step"
+            help = "bp between consecutive fragment starts (larger = fewer reads; keep well below the shortest read length)"
             arg_type = Int
-            default = 50
-        "--fmax"
-            help = "largest fragment length; set to the aligner's max fragment length (bowtie2 -X)"
-            arg_type = Int
-            default = 500
-        "--step-policy"
-            help = "tiling step by fragment length as maxF:step rules"
-            default = DEFAULT_STEP_POLICY
+            default = 1
+        "--orientation"
+            help = "which read orientations to simulate per fragment: both, plus (R1 forward at fragment start) or minus (R1 = revcomp of fragment end)"
+            default = "both"
         "--qual"
             help = "uniform base quality character"
             default = "I"
@@ -161,8 +160,8 @@ function cmd_simulate(args)
         "upstream" => args["upstream"], "downstream" => args["downstream"])
     simulate(fa, loci, args["out"];
              read_lengths=parse_int_list(args["read-lengths"]),
-             fmin=args["fmin"], fmax=args["fmax"],
-             step_policy=parse_step_policy(args["step-policy"]),
+             fragment_lengths=parse_int_list(args["fragment-lengths"]),
+             step=args["step"], orientation=args["orientation"],
              qual=only(args["qual"]), checksum=!args["no-checksum"], provenance)
 end
 

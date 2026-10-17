@@ -12,32 +12,35 @@ const FRAG_MAPQ_RULES = Dict("min" => min, "max" => max)
     LocusFrags
 
 Fate of every simulated fragment of one locus at one read length. Fragments are laid out
-by F index, then start, then orientation (`+`, `-`), matching `fragment_starts`.
+by F index, then start, then orientation (in `orients` order), matching `fragment_starts`.
 """
 struct LocusFrags
     starts::Vector{StepRange{Int,Int}}
     offsets::Vector{Int}
     status::Vector{UInt8}
     mapq::Vector{UInt8}
+    orients::Vector{Char}
 end
 
 function LocusFrags(locus::Locus, seq::AbstractVector{UInt8}, region_start0::Integer, chromlen::Integer,
-                    L::Integer, Fs::AbstractVector{<:Integer}, policy::StepPolicy)
-    starts = [fragment_starts(locus, F, tiling_step(policy, F), chromlen) for F in Fs]
-    offsets = [0; cumsum(2 .* length.(starts))]
+                    L::Integer, Fs::AbstractVector{<:Integer}, step::Integer, orients::AbstractVector{Char})
+    no = length(orients)
+    starts = [fragment_starts(locus, F, step, chromlen) for F in Fs]
+    offsets = [0; cumsum(no .* length.(starts))]
     status = zeros(UInt8, offsets[end])
     for (j, F) in enumerate(Fs), (i, f0) in enumerate(starts[j])
         if fragment_has_n(seq, f0 - region_start0 + 1, F, min(L, F))
-            status[offsets[j]+2i-1] = status[offsets[j]+2i] = ST_SKIPPED
+            status[offsets[j]+no*(i-1)+1:offsets[j]+no*i] .= ST_SKIPPED
         end
     end
-    return LocusFrags(starts, offsets, status, zeros(UInt8, offsets[end]))
+    return LocusFrags(starts, offsets, status, zeros(UInt8, offsets[end]), collect(orients))
 end
 
 function frag_slot(lf::LocusFrags, j::Integer, f0::Integer, orient::Char)
     r = lf.starts[j]
-    f0 in r || return 0
-    return lf.offsets[j] + 2 * div(f0 - first(r), step(r)) + (orient == '-' ? 2 : 1)
+    o = findfirst(==(orient), lf.orients)
+    (o === nothing || !(f0 in r)) && return 0
+    return lf.offsets[j] + length(lf.orients) * div(f0 - first(r), step(r)) + o
 end
 
 struct Mate
@@ -173,8 +176,6 @@ end
 pushrow!(t::NamedTuple, row::NamedTuple) = (foreach(k -> push!(t[k], row[k]), keys(t)); t)
 appendcols!(t::NamedTuple, u::NamedTuple) = (foreach(k -> append!(t[k], u[k]), keys(t)); t)
 
-new_tracks() = (genome_checksum=String[], locus_id=String[], chrom=String[], start0=Int32[], end0=Int32[],
-                L=Int32[], F=Int32[], mapq_cutoff=Int32[], score=Float64[], min_denominator=Int32[])
 new_summary() = (locus_id=String[], chrom=String[], L=Int32[], F=Int32[], mapq_cutoff=Int32[],
                  n_fragments=Int64[], n_skipped_N=Int64[], n_missing=Int64[], n_not_proper=Int64[],
                  n_kept=Int64[], n_correct_kept=Int64[], n_wrong_kept=Int64[],
@@ -185,15 +186,16 @@ new_sites() = (origin_locus=String[], L=Int32[], dest_chrom=String[], dest_bin_s
                dest_bin_end0=Int64[], dest_locus=String[], fragment_mapq=Int32[], n_fragments=Int64[])
 
 """
-    locus_scores!(tracks, summary, locus, lf, L, Fs, cutoffs, checksum)
+    locus_scores!(summary, sc, dn, locus, lf, L, Fs, cutoffs)
 
 Fragment-span coverage via difference arrays: the denominator counts every simulated
 fragment covering a position; the numerator for cutoff c counts those that mapped
-correctly with fragment MAPQ ≥ c. Writes run-length encoded tracks and per-F summaries.
-Returns per-(F, cutoff) totals for the genome-wide summary.
+correctly with fragment MAPQ ≥ c. Fills per-base `sc[x, F, cutoff]` (NaN where nothing
+was simulated) and `dn[x, F]`, and appends per-F summaries. Returns per-(F, cutoff)
+totals for the genome-wide summary.
 """
-function locus_scores!(tracks, summary, locus::Locus, lf::LocusFrags, L::Integer,
-                       Fs::AbstractVector{<:Integer}, cutoffs::AbstractVector{<:Integer}, checksum::AbstractString)
+function locus_scores!(summary, sc::AbstractArray{Float32,3}, dn::AbstractMatrix{UInt16}, locus::Locus,
+                       lf::LocusFrags, L::Integer, Fs::AbstractVector{<:Integer}, cutoffs::AbstractVector{<:Integer})
     n, nc = length(locus), length(cutoffs)
     den = zeros(Int32, n + 1)
     num = zeros(Int32, n + 1, nc)
@@ -203,8 +205,9 @@ function locus_scores!(tracks, summary, locus::Locus, lf::LocusFrags, L::Integer
         fill!(num, 0)
         nfrag = nskip = nmiss = nnp = 0
         kept_ok, kept_wrong = zeros(Int, nc), zeros(Int, nc)
-        for (i, f0) in enumerate(lf.starts[j]), o in 1:2
-            s = lf.offsets[j] + 2(i - 1) + o
+        no = length(lf.orients)
+        for (i, f0) in enumerate(lf.starts[j]), o in 1:no
+            s = lf.offsets[j] + no * (i - 1) + o
             st = lf.status[s]
             if st == ST_SKIPPED
                 nskip += 1
@@ -235,22 +238,12 @@ function locus_scores!(tracks, summary, locus::Locus, lf::LocusFrags, L::Integer
         end
         cumsum!(den, den)
         mind = n > 0 ? Int(minimum(view(den, 1:n))) : 0
+        dn[:, j] .= view(den, 1:n)
         for c in 1:nc
             col = view(num, :, c)
             cumsum!(col, col)
-            ratio(x) = den[x] == 0 ? NaN : col[x] / den[x]
-            x = 1
-            while x <= n
-                sc, mn, y = ratio(x), den[x], x
-                while y < n && isequal(ratio(y + 1), sc)
-                    y += 1
-                    mn = min(mn, den[y])
-                end
-                pushrow!(tracks, (genome_checksum=checksum, locus_id=locus.id, chrom=locus.chrom,
-                                  start0=Int32(locus.start0 + x - 1), end0=Int32(locus.start0 + y),
-                                  L=Int32(L), F=Int32(F), mapq_cutoff=Int32(cutoffs[c]), score=sc,
-                                  min_denominator=Int32(mn)))
-                x = y + 1
+            for x in 1:n
+                sc[x, j, c] = den[x] == 0 ? NaN32 : Float32(col[x] / den[x])
             end
             kept = kept_ok[c] + kept_wrong[c]
             pushrow!(summary, (locus_id=locus.id, chrom=locus.chrom, L=Int32(L), F=Int32(F),
@@ -309,6 +302,11 @@ end
 
 function write_table(path::AbstractString, tbl::NamedTuple)
     isfile(path) && rm(path)
+    # Parquet.jl cannot write zero-row tables
+    if isempty(first(tbl))
+        @info "No rows for $(basename(path)); file not written"
+        return
+    end
     write_parquet(path, tbl)
 end
 
@@ -316,8 +314,8 @@ end
     score_simulation(simdir; bam_dir, out, cutoffs, tolerance=0, frag_mapq="min", fasta=nothing, read_lengths=nothing)
 
 Phase 2 scoring. Reads `bam_dir/sim_L{L}.bam` for each simulated read length and writes
-`mappability_tracks.parquet`, `misplacement_summary.parquet`, `bleed_matrix.parquet`,
-`misplaced_sites.parquet` and `score.toml` to `out`.
+`mappability.zarr` (per-base tracks, see `create_track_store`), `misplacement_summary.parquet`,
+`bleed_matrix.parquet`, `misplaced_sites.parquet` and `score.toml` to `out`.
 """
 function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpath(simdir, "aln"),
                out::AbstractString=joinpath(simdir, "scores"),
@@ -328,7 +326,8 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
     meta = read_simulate_toml(simdir)
     grid = meta["grid"]
     Fs = Vector{Int}(grid["fragment_lengths"])
-    policy = parse_step_policy(grid["step_policy"])
+    tile_step = Int(grid["step"])
+    orients = parse_orientation(grid["orientation"])
     Ls = read_lengths === nothing ? Vector{Int}(grid["read_lengths"]) : collect(Int, read_lengths)
     issubset(Ls, grid["read_lengths"]) || error("read lengths $Ls were not all simulated ($(grid["read_lengths"]))")
     rule = get(FRAG_MAPQ_RULES, frag_mapq, nothing)
@@ -350,42 +349,60 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
     ctx = ScoreContext(loci, Dict(l.id => k for (k, l) in enumerate(loci)),
                        Dict(F => j for (j, F) in enumerate(Fs)), bychrom, tolerance, rule)
 
-    fmax = grid["fmax"]
+    fmax = maximum(Fs)
+    2fmax <= typemax(UInt16) || error("fragment length $fmax is too large for UInt16 denominators")
     regions = [sim_region(l, fmax, chrom_length(fa, l.chrom)) for l in loci]
     seqs = [fetch_seq(fa, l.chrom, r...) for (l, r) in zip(loci, regions)]
+
+    mkpath(out)
+    zpath = joinpath(out, "mappability.zarr")
+    store = create_track_store(zpath, loci, Ls, Fs, cutoffs;
+                               attrs=Dict("genome_checksum" => checksum, "fragment_mapq_rule" => frag_mapq,
+                                          "tolerance" => tolerance, "step" => tile_step,
+                                          "orientation" => grid["orientation"]))
+    zlock = ReentrantLock()
 
     results = Vector{Any}(undef, length(Ls))
     @info "Scoring $(length(loci)) loci" read_lengths = join(Ls, ",") cutoffs = join(cutoffs, ",") threads = Threads.nthreads()
     Threads.@threads :dynamic for t in eachindex(Ls)
         L = Ls[t]
-        frags = [LocusFrags(l, seqs[k], regions[k][1], chrom_length(fa, l.chrom), L, Fs, policy)
+        frags = [LocusFrags(l, seqs[k], regions[k][1], chrom_length(fa, l.chrom), L, Fs, tile_step, orients)
                  for (k, l) in enumerate(loci)]
         for (k, l) in enumerate(loci), (j, F) in enumerate(Fs)
             exp = get(tiling, (l.id, L, F), nothing)
             exp === nothing && error("tiling.tsv has no row for ($(l.id), L=$L, F=$F)")
             lf = frags[k]
-            got = (length(lf.starts[j]), count(==(ST_SKIPPED), view(lf.status, lf.offsets[j]+1:lf.offsets[j+1])) ÷ 2)
+            got = (length(lf.starts[j]),
+                   count(==(ST_SKIPPED), view(lf.status, lf.offsets[j]+1:lf.offsets[j+1])) ÷ length(orients))
             exp == got || error("tiling mismatch for ($(l.id), L=$L, F=$F): simulate wrote (starts, N-skipped) = " *
-                                "$exp, rescoring expects $got; was the reference or step policy changed?")
+                                "$exp, rescoring expects $got; was the reference changed?")
         end
         stats, bleed, sites, refnames = scan_bam!(frags, ctx, bams[L])
-        tracks, summary, bleed_tbl, sites_tbl = new_tracks(), new_summary(), new_bleed(), new_sites()
-        totals = [locus_scores!(tracks, summary, l, frags[k], L, Fs, cutoffs, checksum) for (k, l) in enumerate(loci)]
+        summary, bleed_tbl, sites_tbl = new_summary(), new_bleed(), new_sites()
+        totals = map(enumerate(loci)) do (k, l)
+            sc = Array{Float32}(undef, length(l), length(Fs), length(cutoffs))
+            dn = Matrix{UInt16}(undef, length(l), length(Fs))
+            tot = locus_scores!(summary, sc, dn, l, frags[k], L, Fs, cutoffs)
+            rows = store.offsets[k]+1:store.offsets[k+1]
+            lock(zlock) do
+                store.score[rows, :, :, t] = sc
+                store.denominator[rows, :, t] = dn
+            end
+            tot
+        end
         genome_wide_rows!(summary, L, totals)
         bleed_rows!(bleed_tbl, sites_tbl, loci, L, cutoffs, bleed, sites, refnames)
-        results[t] = (; stats, tracks, summary, bleed_tbl, sites_tbl)
+        results[t] = (; stats, summary, bleed_tbl, sites_tbl)
         @info "Scored L=$L" bam = bams[L] pairs = stats.pairs incomplete = stats.incomplete
     end
+    Zarr.consolidate_metadata(store.group)
 
-    mkpath(out)
-    all_tracks, all_summary, all_bleed, all_sites = new_tracks(), new_summary(), new_bleed(), new_sites()
+    all_summary, all_bleed, all_sites = new_summary(), new_bleed(), new_sites()
     for r in results
-        appendcols!(all_tracks, r.tracks)
         appendcols!(all_summary, r.summary)
         appendcols!(all_bleed, r.bleed_tbl)
         appendcols!(all_sites, r.sites_tbl)
     end
-    write_table(joinpath(out, "mappability_tracks.parquet"), all_tracks)
     write_table(joinpath(out, "misplacement_summary.parquet"), all_summary)
     write_table(joinpath(out, "bleed_matrix.parquet"), all_bleed)
     write_table(joinpath(out, "misplaced_sites.parquet"), all_sites)
@@ -408,6 +425,65 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
                             for (t, r) in enumerate(results)),
     )
     open(io -> TOML.print(io, smeta), joinpath(out, "score.toml"), "w")
-    @info "Wrote scores" out track_rows = length(all_tracks.score)
-    return (; tracks=all_tracks, summary=all_summary, bleed=all_bleed, sites=all_sites)
+    @info "Wrote scores" out
+    return (; tracks=zpath, summary=all_summary, bleed=all_bleed, sites=all_sites)
 end
+
+const CHUNK_POSITIONS = 16_384
+
+"""
+    create_track_store(path, loci, Ls, Fs, cutoffs; attrs) -> (; group, score, denominator, offsets)
+
+Zarr (v2) group holding per-base tracks for all loci concatenated end to end:
+
+- `score[position, F, mapq_cutoff, L]`: Float32, NaN where no fragment was simulated
+- `denominator[position, F, L]`: UInt16 simulated fragments covering each base
+- 1-D coordinate arrays `L`, `F`, `mapq_cutoff`
+
+Locus `k` occupies positions `offsets[k]+1:offsets[k+1]` (attribute `loci`). Dimension
+names are stored as `_ARRAY_DIMENSIONS` in C order (what xarray/zarr-python see).
+"""
+function create_track_store(path::AbstractString, loci::AbstractVector{Locus}, Ls, Fs, cutoffs;
+                            attrs::AbstractDict=Dict{String,Any}())
+    isdir(path) && rm(path; recursive=true)
+    offsets = [0; cumsum(length.(loci))]
+    npos, nF, nc, nL = offsets[end], length(Fs), length(cutoffs), length(Ls)
+    chunk = min(CHUNK_POSITIONS, npos)
+    comp = Zarr.BloscCompressor(cname="zstd", clevel=5, shuffle=2)
+    loci_attr = [Dict("locus_id" => l.id, "chrom" => l.chrom, "start0" => l.start0, "end0" => l.end0,
+                      "strand" => string(l.strand), "offset" => offsets[k]) for (k, l) in enumerate(loci)]
+    gattrs = merge(Dict{String,Any}(attrs), Dict("loci" => loci_attr, "read_lengths" => collect(Int, Ls),
+                   "fragment_lengths" => collect(Int, Fs), "mapq_cutoffs" => collect(Int, cutoffs),
+                   "n_positions" => npos))
+    g = zgroup(path; attrs=gattrs)
+    score = zcreate(Float32, g, "score", npos, nF, nc, nL; chunks=(chunk, nF, nc, 1), fill_value=NaN32,
+                    compressor=comp, attrs=Dict("_ARRAY_DIMENSIONS" => ["L", "mapq_cutoff", "F", "position"]))
+    den = zcreate(UInt16, g, "denominator", npos, nF, nL; chunks=(chunk, nF, 1), fill_value=UInt16(0),
+                  compressor=comp, attrs=Dict("_ARRAY_DIMENSIONS" => ["L", "F", "position"]))
+    for (name, vals) in (("L", Ls), ("F", Fs), ("mapq_cutoff", cutoffs))
+        z = zcreate(Int32, g, name, length(vals); attrs=Dict("_ARRAY_DIMENSIONS" => [name]))
+        z[:] = Int32.(vals)
+    end
+    return (; group=g, score, denominator=den, offsets)
+end
+
+"""
+    locus_track(zarr, locus_id; L, F, mapq_cutoff) -> (; chrom, start0, score, denominator)
+
+Per-base score and denominator for one locus and channel from a `mappability.zarr`
+(path or opened group). Position `i` of the vectors is genomic `start0 + i - 1` (0-based).
+"""
+function locus_track(g::Zarr.ZGroup, locus_id::AbstractString; L::Integer, F::Integer, mapq_cutoff::Integer)
+    loci = g.attrs["loci"]
+    k = findfirst(l -> l["locus_id"] == locus_id, loci)
+    k === nothing && error("locus '$locus_id' is not in this store")
+    idx(key, v) = something(findfirst(==(v), g.attrs[key]), 0)
+    iL, iF, ic = idx("read_lengths", L), idx("fragment_lengths", F), idx("mapq_cutoffs", mapq_cutoff)
+    (iL == 0 || iF == 0 || ic == 0) && error("(L=$L, F=$F, mapq_cutoff=$mapq_cutoff) is not on the stored grid")
+    l = loci[k]
+    rows = l["offset"]+1:l["offset"]+l["end0"]-l["start0"]
+    return (; chrom=l["chrom"], start0=l["start0"], score=g["score"][rows, iF, ic, iL],
+            denominator=g["denominator"][rows, iF, iL])
+end
+
+locus_track(path::AbstractString, locus_id::AbstractString; kw...) = locus_track(zopen(path), locus_id; kw...)

@@ -43,19 +43,14 @@ write_fasta_with_fai(FASTA, ["chr1" => CHR1[1:999] * lowercase(CHR1[1000:1100]) 
 
 @testset "UniMap" begin
 
-@testset "fragment length grid" begin
-    @test fragment_length_grid(50, 500) ==
-          [50, 51, 52, 54, 56, 60, 64, 72, 80, 96, 112, 144, 176, 240, 304, 432, 500]
-    @test fragment_length_grid(100, 100) == [100]
-    @test fragment_length_grid(50, 53) == [50, 51, 52, 53]
-    @test_throws ArgumentError fragment_length_grid(60, 50)
-end
-
-@testset "step policy" begin
-    p = parse_step_policy("150:1,300:2,*:5")
-    @test tiling_step.(Ref(p), [50, 150, 151, 300, 301, 500]) == [1, 1, 2, 2, 5, 5]
-    @test string(p) == "150:1,300:2,*:5"
-    @test_throws ArgumentError parse_step_policy("150:1")
+@testset "length lists and orientation" begin
+    @test parse_int_list("150, 50,100,50") == [50, 100, 150]
+    @test UniMap.check_lengths("x", [3, 1, 2]) == [1, 2, 3]
+    @test_throws ArgumentError UniMap.check_lengths("x", Int[])
+    @test_throws ArgumentError UniMap.check_lengths("x", [0, 5])
+    @test parse_orientation("both") == ['+', '-']
+    @test parse_orientation("plus") == ['+'] && parse_orientation("minus") == ['-']
+    @test_throws ArgumentError parse_orientation("+")
 end
 
 @testset "indexed FASTA" begin
@@ -129,9 +124,8 @@ end
     locus = Locus("loc1", "chr1", 100_000, 100_400, '+', 100_000, 100_400, "loc1", "", "")
     out = joinpath(DIR, "sim1")
     Ls = [40, 100]
-    rows = simulate(fa, [locus], out; read_lengths=Ls, fmin=30, fmax=150,
-                    step_policy=parse_step_policy("*:1"), checksum=false)
-    Fs = fragment_length_grid(30, 150)
+    Fs = [30, 40, 60, 100, 150]
+    rows = simulate(fa, [locus], out; read_lengths=Ls, fragment_lengths=Fs, checksum=false)
     @test length(rows) == length(Ls) * length(Fs)
     @test all(r -> r.n_skipped_N == 0, rows)
     @test isfile(joinpath(out, "simulate.toml")) && isfile(joinpath(out, "tiling.tsv"))
@@ -162,13 +156,34 @@ end
         # every scored position is covered by F starts × 2 orientations
         @test all(F -> all(==(2F), cov[F]), Fs)
     end
+    @test_throws ArgumentError simulate(fa, [locus], out; read_lengths=Int[], fragment_lengths=Fs, checksum=false)
+    @test_throws ArgumentError simulate(fa, [locus], out; read_lengths=Ls, fragment_lengths=Fs, step=0, checksum=false)
+end
+
+@testset "single orientation and thinned tiling" begin
+    fa = IndexedFasta(FASTA)
+    locus = Locus("loc2", "chr1", 120_000, 120_300, '+', 120_000, 120_300, "loc2", "", "")
+    both = simulate(fa, [locus], joinpath(DIR, "o_both"); read_lengths=[50], fragment_lengths=[100], checksum=false)
+    for (o, c) in (("plus", '+'), ("minus", '-'))
+        out = joinpath(DIR, "o_$o")
+        r = only(simulate(fa, [locus], out; read_lengths=[50], fragment_lengths=[100], orientation=o, checksum=false))
+        @test r.n_pairs == only(both).n_pairs ÷ 2
+        reads = read_fastq_gz(joinpath(out, "fastq", "L50", "loc2_R1.fq.gz"))
+        @test length(reads) == r.n_pairs && all(x -> parse_read_name(x.name).orient == c, reads)
+        @test occursin("orientation = \"$o\"", read(joinpath(out, "simulate.toml"), String))
+    end
+    @test_throws ArgumentError simulate(fa, [locus], joinpath(DIR, "o_bad"); read_lengths=[50],
+                                       fragment_lengths=[100], orientation="sideways", checksum=false)
+
+    r = only(simulate(fa, [locus], joinpath(DIR, "thin"); read_lengths=[50], fragment_lengths=[100], step=10, checksum=false))
+    @test r.step == 10 && r.n_starts == length(fragment_starts(locus, 100, 10, 200_000)) == cld(300 + 99, 10)
+    @test r.n_pairs == 2r.n_starts
 end
 
 @testset "N fragments are skipped" begin
     fa = IndexedFasta(FASTA)
     locus = Locus("nloc", "chr2", 9_900, 10_100, '+', 9_900, 10_100, "nloc", "", "")
-    rows = simulate(fa, [locus], joinpath(DIR, "sim2"); read_lengths=[50], fmin=60, fmax=60,
-                    step_policy=parse_step_policy("*:1"), checksum=false)
+    rows = simulate(fa, [locus], joinpath(DIR, "sim2"); read_lengths=[50], fragment_lengths=[60], checksum=false)
     r = only(rows)
     # starts whose first or last 50 bp touch [10000, 10010)
     expected = count(f0 -> (f0 < 10_010 && f0 + 50 > 10_000) || (f0 + 10 < 10_010 && f0 + 60 > 10_000),
@@ -187,10 +202,11 @@ end
 @testset "threaded tiling summaries" begin
     fa = IndexedFasta(FASTA)
     loci = [Locus("t$k", "chr1", 10_000k, 10_000k + 300 + 100k, '+', 0, 0, "", "", "") for k in 1:6]
-    rows = simulate(fa, loci, joinpath(DIR, "sim3"); read_lengths=[40, 100], fmin=50, fmax=200, checksum=false)
-    for l in loci, F in fragment_length_grid(50, 200)
+    Fs = [50, 75, 150, 200]
+    rows = simulate(fa, loci, joinpath(DIR, "sim3"); read_lengths=[40, 100], fragment_lengths=Fs, step=3, checksum=false)
+    for l in loci, F in Fs
         n = [r.n_starts for r in rows if r.locus_id == l.id && r.F == F]
-        @test length(n) == 2 && n[1] == n[2] == length(fragment_starts(l, F, tiling_step(parse_step_policy("150:1,300:2,*:5"), F), 200_000))
+        @test length(n) == 2 && n[1] == n[2] == length(fragment_starts(l, F, 3, 200_000))
     end
 end
 
@@ -198,7 +214,7 @@ end
     gff = joinpath(DIR, "ann.gff3")
     out = joinpath(DIR, "cli")
     @test UniMap.main(["simulate", "-f", FASTA, "-a", gff, "-g", "geneA,geneB", "-o", out,
-                       "-L", "50", "--fmin", "100", "--fmax", "120"]) == 0
+                       "-L", "50", "-F", "100,120"]) == 0
     @test isfile(joinpath(out, "fastq", "L50", "geneA_R1.fq.gz"))
     @test isfile(joinpath(out, "fastq", "L50", "geneB_R2.fq.gz"))
     @test length(read_loci(joinpath(out, "loci.tsv"))) == 2
@@ -252,29 +268,37 @@ if have_aligner
             mk("dupB", "chrA", 149_500, 151_500), mk("nearA", "chrA", 79_500, 82_500),
             mk("nearB", "chrB", 29_500, 32_500)]
     sim = joinpath(dir, "sim")
-    simulate(IndexedFasta(fasta), loci, sim; read_lengths=[50], fmin=100, fmax=400,
-             step_policy=parse_step_policy("*:1"), checksum=false)
+    Fs = [100, 150, 200, 300, 400]
+    simulate(IndexedFasta(fasta), loci, sim; read_lengths=[50], fragment_lengths=Fs, checksum=false)
     script = write_align_script(sim; index=joinpath(dir, "g"), threads=4)
     run(pipeline(`bash $script`; stdout=devnull))
     @test isfile(joinpath(sim, "aln", "sim_L50.bam"))
 
     res = score_simulation(sim)
-    for f in ("mappability_tracks", "misplacement_summary", "bleed_matrix", "misplaced_sites")
+    for f in ("misplacement_summary", "bleed_matrix", "misplaced_sites")
         @test isfile(joinpath(sim, "scores", "$f.parquet"))
     end
-    t, s, b = res.tracks, res.summary, res.bleed
+    zpath = joinpath(sim, "scores", "mappability.zarr")
+    @test res.tracks == zpath && isdir(zpath)
+    s, b = res.summary, res.bleed
     rows(tbl, pred) = [i for i in eachindex(first(tbl)) if pred(i)]
+    cuts = [0, 2, 5, 10, 20, 30]
     function at(id, F, c, x)
-        i = only(rows(t, i -> t.locus_id[i] == id && t.F[i] == F && t.mapq_cutoff[i] == c && t.start0[i] <= x < t.end0[i]))
-        return t.score[i]
+        tr = locus_track(zpath, id; L=50, F, mapq_cutoff=c)
+        return tr.score[x-tr.start0+1]
     end
-    Fs = fragment_length_grid(100, 400)
+
+    z = UniMap.Zarr.zopen(zpath; consolidated=true)
+    @test size(z["score"]) == (sum(length, loci), length(Fs), length(cuts), 1)
+    @test z["L"][:] == [50] && z["F"][:] == Fs && z["mapq_cutoff"][:] == cuts
+    @test [l["offset"] for l in z.attrs["loci"]] == [0; cumsum(length.(loci))[1:end-1]]
 
     # unique sequence: every position maps back at every cutoff; denominator constant (= 2F)
-    u = rows(t, i -> t.locus_id[i] == "uniq")
-    @test all(i -> t.score[i] == 1.0, u)
-    @test all(i -> t.min_denominator[i] == 2 * t.F[i], u)
-    @test length(u) == length(Fs) * 6
+    for F in Fs, c in cuts
+        tr = locus_track(z, "uniq"; L=50, F, mapq_cutoff=c)
+        @test length(tr.score) == 2000 && all(==(1.0f0), tr.score) && all(==(2F), tr.denominator)
+    end
+    @test_throws ErrorException locus_track(z, "uniq"; L=50, F=99, mapq_cutoff=0)
     @test all(==(0), s.n_missing) && all(==(0), s.n_not_proper)
 
     # exact duplicate: ~0 inside at cutoff 2, recovered near the edge by long fragments
@@ -295,6 +319,18 @@ if have_aligner
 
     g = rows(s, i -> s.locus_id[i] == "ALL")
     @test length(g) == length(Fs) * 6
+
+    # single orientation + thinned tiling: same scores in unique sequence, denominator F/step
+    sim1 = joinpath(dir, "sim_minus")
+    simulate(IndexedFasta(fasta), loci[1:2], sim1; read_lengths=[50], fragment_lengths=Fs,
+             step=2, orientation="minus", checksum=false)
+    run(pipeline(`bash $(write_align_script(sim1; index=joinpath(dir, "g"), threads=4))`; stdout=devnull))
+    z1 = score_simulation(sim1; cutoffs=[2]).tracks
+    for F in Fs
+        tr = locus_track(z1, "uniq"; L=50, F, mapq_cutoff=2)
+        @test all(==(1.0f0), tr.score) && all(==(F ÷ 2), tr.denominator)
+    end
+    @test locus_track(z1, "dupA"; L=50, F=100, mapq_cutoff=2).score[50_500-49_500+1] < 0.05
 end
 end
 
