@@ -63,7 +63,7 @@ end
     @test_throws ArgumentError fetch_seq(fa, "chr1", 199_990, 200_001)
 end
 
-@testset "annotation → loci" begin
+@testset "annotation -> loci" begin
     gff = joinpath(DIR, "ann.gff3")
     write(gff, """
     ##gff-version 3
@@ -153,7 +153,7 @@ end
             end
         end
         @test ok
-        # every scored position is covered by F starts × 2 orientations
+        # every scored position is covered by F starts x 2 orientations
         @test all(F -> all(==(2F), cov[F]), Fs)
     end
     @test_throws ArgumentError simulate(fa, [locus], out; read_lengths=Int[], fragment_lengths=Fs, checksum=false)
@@ -167,7 +167,7 @@ end
     for (o, c) in (("plus", '+'), ("minus", '-'))
         out = joinpath(DIR, "o_$o")
         r = only(simulate(fa, [locus], out; read_lengths=[50], fragment_lengths=[100], orientation=o, checksum=false))
-        @test r.n_pairs == only(both).n_pairs ÷ 2
+        @test r.n_pairs == div(only(both).n_pairs, 2)
         reads = read_fastq_gz(joinpath(out, "fastq", "L50", "loc2_R1.fq.gz"))
         @test length(reads) == r.n_pairs && all(x -> parse_read_name(x.name).orient == c, reads)
         @test occursin("orientation = \"$o\"", read(joinpath(out, "simulate.toml"), String))
@@ -199,13 +199,25 @@ end
     @test first(starts) == 0 && last(starts) == 99
 end
 
+@testset "merging loci into simulation regions" begin
+    mk(id, chrom, s, e) = Locus(id, chrom, s, e, '+', s, e, id, "", "")
+    # fmax = 100: loci share a fragment iff the gap is <= 98 bp
+    loci = [mk("A", "c1", 100, 1000), mk("D", "c2", 0, 50), mk("B", "c1", 900, 2000),
+            mk("C", "c1", 2098, 2200), mk("E", "c1", 2299, 2400)]
+    r = UniMap.merge_regions(loci, 100)
+    @test [x.id for x in r] == ["A+B+C", "D", "E"]
+    @test (r[1].start0, r[1].end0) == (100, 2200)
+    @test UniMap.region_members(r[1]) == ["A", "B", "C"]
+    @test only(UniMap.merge_regions(loci[1:1], 100)).id == "A"
+end
+
 @testset "threaded tiling summaries" begin
     fa = IndexedFasta(FASTA)
     loci = [Locus("t$k", "chr1", 10_000k, 10_000k + 300 + 100k, '+', 0, 0, "", "", "") for k in 1:6]
     Fs = [50, 75, 150, 200]
     rows = simulate(fa, loci, joinpath(DIR, "sim3"); read_lengths=[40, 100], fragment_lengths=Fs, step=3, checksum=false)
     for l in loci, F in Fs
-        n = [r.n_starts for r in rows if r.locus_id == l.id && r.F == F]
+        n = [r.n_starts for r in rows if r.region_id == l.id && r.F == F]
         @test length(n) == 2 && n[1] == n[2] == length(fragment_starts(l, F, 3, 200_000))
     end
 end
@@ -215,9 +227,11 @@ end
     out = joinpath(DIR, "cli")
     @test UniMap.main(["simulate", "-f", FASTA, "-a", gff, "-g", "geneA,geneB", "-o", out,
                        "-L", "50", "-F", "100,120"]) == 0
-    @test isfile(joinpath(out, "fastq", "L50", "geneA_R1.fq.gz"))
-    @test isfile(joinpath(out, "fastq", "L50", "geneB_R2.fq.gz"))
+    # geneA's downstream flank overlaps geneB, so they are simulated as one region
+    @test isfile(joinpath(out, "fastq", "L50", "geneA+geneB_R1.fq.gz"))
+    @test isfile(joinpath(out, "fastq", "L50", "geneA+geneB_R2.fq.gz"))
     @test length(read_loci(joinpath(out, "loci.tsv"))) == 2
+    @test only(read_loci(joinpath(out, "regions.tsv"))).query == "geneA,geneB"
     @test occursin("sha256", read(joinpath(out, "simulate.toml"), String))
 
     @test UniMap.main(["align-script", "-s", out, "-x", joinpath(DIR, "noindex"), "-t", "2",
@@ -242,6 +256,13 @@ end
     @test UniMap.classify_pair(M(99, 2, 100, 42, 200), M(147, 2, 250, 42, -200), plus, refs) == W
     @test UniMap.classify_pair(M(97, 1, 100, 42, 200), M(145, 1, 250, 42, -200), plus, refs) == N
     @test UniMap.classify_pair(M(99, 1, 100, 42, 200), nothing, plus, refs) == N
+end
+
+@testset "derived quantities" begin
+    @test map_back(3, 4) == 0.75f0 && isnan(map_back(0, 0))
+    @test ectopic_rate(6, 4) == 1.5f0 && isnan(ectopic_rate(1, 0))
+    @test log2_ratio(7.5, 1.5) == 2 && isnan(log2_ratio(0, 0)) && log2_ratio(0, 1) < 0
+    @test log2_ratio(3, 0; pseudocount=1) == 2
 end
 
 have_aligner = all(x -> Sys.which(x) !== nothing, ("bowtie2", "bowtie2-build", "samtools"))
@@ -283,20 +304,26 @@ if have_aligner
     s, b = res.summary, res.bleed
     rows(tbl, pred) = [i for i in eachindex(first(tbl)) if pred(i)]
     cuts = [0, 2, 5, 10, 20, 30]
-    function at(id, F, c, x)
-        tr = locus_track(zpath, id; L=50, F, mapq_cutoff=c)
-        return tr.score[x-tr.start0+1]
+    function track_at(z, id, F, c, x)
+        tr = locus_track(z, id; L=50, F, mapq_cutoff=c)
+        i = x - tr.start0 + 1
+        return (; n_correct=tr.n_correct[i], n_ectopic=tr.n_ectopic[i], map_back=tr.map_back[i],
+                ectopic_rate=tr.ectopic_rate[i], log2_ratio=tr.log2_ratio[i])
     end
+    at(id, F, c, x) = track_at(zpath, id, F, c, x).map_back
 
     z = UniMap.Zarr.zopen(zpath; consolidated=true)
-    @test size(z["score"]) == (sum(length, loci), length(Fs), length(cuts), 1)
+    @test size(z["n_correct"]) == size(z["n_ectopic"]) == (sum(length, loci), length(Fs), length(cuts), 1)
+    @test size(z["n_simulated"]) == (sum(length, loci), length(Fs), 1)
     @test z["L"][:] == [50] && z["F"][:] == Fs && z["mapq_cutoff"][:] == cuts
     @test [l["offset"] for l in z.attrs["loci"]] == [0; cumsum(length.(loci))[1:end-1]]
 
-    # unique sequence: every position maps back at every cutoff; denominator constant (= 2F)
+    # unique sequence: everything maps back, nothing lands, n_simulated constant (= 2F)
     for F in Fs, c in cuts
         tr = locus_track(z, "uniq"; L=50, F, mapq_cutoff=c)
-        @test length(tr.score) == 2000 && all(==(1.0f0), tr.score) && all(==(2F), tr.denominator)
+        @test length(tr.map_back) == 2000 && all(==(1.0f0), tr.map_back) && all(==(2F), tr.n_simulated)
+        @test all(==(0), tr.n_ectopic) && all(==(0f0), tr.ectopic_rate)
+        @test all(isapprox.(tr.log2_ratio, log2((2F + 0.5) / 0.5)))
     end
     @test_throws ErrorException locus_track(z, "uniq"; L=50, F=99, mapq_cutoff=0)
     @test all(==(0), s.n_missing) && all(==(0), s.n_not_proper)
@@ -307,10 +334,19 @@ if have_aligner
     @test at("dupA", 400, 2, 50_100) > at("dupA", 100, 2, 50_100)
     @test at("dupA", 100, 0, 49_600) == 1.0
 
+    # inside the exact duplicate at cutoff 0, about half of dupA's reads come home and dupB
+    # sends about as many: ex-map rate ~0.5, log2 ratio ~0; at cutoff 2 nothing comes or goes
+    d0 = track_at(z, "dupA", 100, 0, 50_500)
+    @test 0.3 < d0.map_back < 0.7 && 0.3 < d0.ectopic_rate < 0.7 && abs(d0.log2_ratio) < 1
+    d2 = track_at(z, "dupA", 100, 2, 50_500)
+    @test d2.n_correct == 0 && d2.n_ectopic == 0 && isnan(d2.log2_ratio)
+    @test maximum(locus_track(z, "nearA"; L=50, F=100, mapq_cutoff=0).ectopic_rate) > 0
+
     # near duplicate: intermediate, with bleed into the copy at low cutoffs
     sA = rows(s, i -> s.locus_id[i] == "nearA" && s.F[i] == 100 && s.mapq_cutoff[i] == 0)
     @test 0.2 < s.frac_correct[only(sA)] < 0.99
     @test s.n_wrong_kept[only(sA)] > 0
+    @test s.n_ectopic_landed[only(sA)] > 0
     bleed_to(o, d, c) = sum((b.n_fragments[i] for i in rows(b, i -> b.origin_locus[i] == o &&
                              b.dest_locus[i] == d && b.mapq_cutoff[i] == c)); init=0)
     @test bleed_to("nearA", "nearB", 0) > 0
@@ -320,17 +356,25 @@ if have_aligner
     g = rows(s, i -> s.locus_id[i] == "ALL")
     @test length(g) == length(Fs) * 6
 
-    # single orientation + thinned tiling: same scores in unique sequence, denominator F/step
+    # single orientation + thinned tiling, without dupB in the panel and with a locus
+    # overlapping dupA (merged into one simulation region)
     sim1 = joinpath(dir, "sim_minus")
-    simulate(IndexedFasta(fasta), loci[1:2], sim1; read_lengths=[50], fragment_lengths=Fs,
+    loci1 = [loci[1], loci[2], mk("dupA_ov", "chrA", 51_000, 53_000)]
+    simulate(IndexedFasta(fasta), loci1, sim1; read_lengths=[50], fragment_lengths=Fs,
              step=2, orientation="minus", checksum=false)
+    @test [r.id for r in read_loci(joinpath(sim1, "regions.tsv"))] == ["uniq", "dupA+dupA_ov"]
     run(pipeline(`bash $(write_align_script(sim1; index=joinpath(dir, "g"), threads=4))`; stdout=devnull))
-    z1 = score_simulation(sim1; cutoffs=[2]).tracks
+    z1 = score_simulation(sim1; cutoffs=[0, 2]).tracks
     for F in Fs
         tr = locus_track(z1, "uniq"; L=50, F, mapq_cutoff=2)
-        @test all(==(1.0f0), tr.score) && all(==(F ÷ 2), tr.denominator)
+        @test all(==(1.0f0), tr.map_back) && all(==(div(F, 2)), tr.n_simulated)
     end
-    @test locus_track(z1, "dupA"; L=50, F=100, mapq_cutoff=2).score[50_500-49_500+1] < 0.05
+    @test track_at(z1, "dupA", 100, 2, 50_500).map_back < 0.05
+    # dupB is not in the panel, so nothing lands on dupA
+    @test track_at(z1, "dupA", 100, 0, 50_500).n_ectopic == 0
+    a = locus_track(z1, "dupA"; L=50, F=200, mapq_cutoff=0)
+    b1 = locus_track(z1, "dupA_ov"; L=50, F=200, mapq_cutoff=0)
+    @test a.n_correct[end-499:end] == b1.n_correct[1:500] && a.n_simulated[end-499:end] == b1.n_simulated[1:500]
 end
 end
 

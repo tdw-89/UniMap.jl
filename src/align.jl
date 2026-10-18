@@ -62,8 +62,8 @@ function write_align_script(simdir::AbstractString; index::AbstractString, threa
     mkdir -p aln
     "\$BOWTIE2" --version > aln/bowtie2_version.txt
 
-    locus_ids() { tail -n +2 loci.tsv | cut -f1; }
-    # Concatenate one mate's FASTQ across loci in loci.tsv order, so R1/R2 stay in step.
+    locus_ids() { tail -n +2 regions.tsv | cut -f1; }
+    # Concatenate one mate's FASTQ across regions in regions.tsv order, so R1/R2 stay in step.
     mates() { locus_ids | while read -r id; do gzip -dc "fastq/L\$1/\${id}_\$2.fq.gz"; done; }
 
     for L in "\${READ_LENGTHS[@]}"; do

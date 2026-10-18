@@ -38,17 +38,17 @@ function fragment_has_n(seq::AbstractVector{UInt8}, i::Integer, F::Integer, m::I
 end
 
 """
-    read_name(locus_id, chrom, frag_start0, F, orient)
+    read_name(region_id, chrom, frag_start0, F, orient)
 
-`locusID|chrom|fragStart0|F|orient`. `orient` is `+` (R1 from the forward strand at the
+`regionID|chrom|fragStart0|F|orient`. `orient` is `+` (R1 from the forward strand at the
 fragment start) or `-` (R1 = reverse complement of the fragment end).
 """
-read_name(locus_id, chrom, frag_start0, F, orient::Char) = "$locus_id|$chrom|$frag_start0|$F|$orient"
+read_name(region_id, chrom, frag_start0, F, orient::Char) = "$region_id|$chrom|$frag_start0|$F|$orient"
 
 function parse_read_name(name::AbstractString)
     f = split(name, '|')
     length(f) == 5 || throw(ArgumentError("not a UniMap read name: $name"))
-    return (locus_id=String(f[1]), chrom=String(f[2]), frag_start0=parse(Int, f[3]),
+    return (region_id=String(f[1]), chrom=String(f[2]), frag_start0=parse(Int, f[3]),
             F=parse(Int, f[4]), orient=f[5][1])
 end
 
@@ -65,11 +65,11 @@ end
 """
     TileSummary
 
-One row of `tiling.tsv`: what was simulated for one (locus, L, F). Scoring re-enumerates
+One row of `tiling.tsv`: what was simulated for one (region, L, F). Scoring re-enumerates
 fragments with `fragment_starts`/`fragment_has_n` to rebuild denominators.
 """
 struct TileSummary
-    locus_id::String
+    region_id::String
     L::Int
     F::Int
     step::Int
@@ -139,7 +139,7 @@ function validate_loci(fa::IndexedFasta, loci::AbstractVector{Locus}, fmax::Inte
     ids = [l.id for l in loci]
     allunique(ids) || error("duplicate locus IDs: " * join(unique(filter(i -> count(==(i), ids) > 1, ids)), ", "))
     for l in loci
-        occursin(r"[\s|/]", l.id) && error("locus ID '$(l.id)' contains whitespace, '|' or '/'")
+        occursin(r"[\s|/,]", l.id) && error("locus ID '$(l.id)' contains whitespace, '|', '/' or ','")
         haskey(fa, l.chrom) || error("locus $(l.id): '$(l.chrom)' not in reference")
         0 <= l.start0 < l.end0 <= chrom_length(fa, l.chrom) || error("locus $(l.id): bad interval [$(l.start0), $(l.end0))")
         n = length(read_name(l.id, l.chrom, chrom_length(fa, l.chrom), fmax, '+'))
@@ -170,10 +170,12 @@ end
 """
     simulate(fa, loci, outdir; read_lengths, fragment_lengths, step=1, orientation="both", qual='I', checksum=true, provenance=Dict())
 
-Phase 1 tiler. For each (locus, L) writes `fastq/L{L}/{locus}_R1.fq.gz` and `_R2.fq.gz`
-containing every F in `fragment_lengths`, with fragment starts every `step` bp, plus
-`loci.tsv`, `loci.bed`, `tiling.tsv` and `simulate.toml` (provenance) in `outdir`.
-`orientation` is `both`, `plus` or `minus`. Threads over loci.
+Phase 1 tiler. Loci that could share fragments are merged into simulation regions
+(`merge_regions`), so each genomic fragment is simulated once. For each (region, L) writes
+`fastq/L{L}/{region}_R1.fq.gz` and `_R2.fq.gz` containing every F in `fragment_lengths`,
+with fragment starts every `step` bp, plus `loci.tsv`, `loci.bed`, `regions.tsv`,
+`tiling.tsv` and `simulate.toml` (provenance) in `outdir`. `orientation` is `both`,
+`plus` or `minus`. Threads over regions.
 """
 function simulate(fa::IndexedFasta, loci::AbstractVector{Locus}, outdir::AbstractString;
                   read_lengths::AbstractVector{<:Integer}, fragment_lengths::AbstractVector{<:Integer},
@@ -186,37 +188,42 @@ function simulate(fa::IndexedFasta, loci::AbstractVector{Locus}, outdir::Abstrac
     orients = parse_orientation(orientation)
     fmax = maximum(Fs)
     validate_loci(fa, loci, fmax)
+    regions = merge_regions(loci, fmax)
+    validate_loci(fa, regions, fmax)
+    length(regions) < length(loci) &&
+        @info "Merged $(length(loci)) loci into $(length(regions)) simulation regions" merged = [r.id for r in regions if occursin(',', r.query)]
 
     for L in Ls
         mkpath(joinpath(outdir, "fastq", "L$L"))
     end
     sha = checksum ? (@info("Computing SHA-256 of $(fa.path)"); file_sha256(fa.path)) : "not computed"
 
-    @info "Tiling $(length(loci)) loci" read_lengths = join(Ls, ",") fragment_lengths = join(Fs, ",") step orientation threads = Threads.nthreads()
-    results = Vector{Vector{TileSummary}}(undef, length(loci))
-    Threads.@threads :dynamic for k in eachindex(loci)
-        locus = loci[k]
-        chromlen = chrom_length(fa, locus.chrom)
-        rs, re = sim_region(locus, fmax, chromlen)
-        seq = fetch_seq(fa, locus.chrom, rs, re)
+    @info "Tiling $(length(regions)) regions" read_lengths = join(Ls, ",") fragment_lengths = join(Fs, ",") step orientation threads = Threads.nthreads()
+    results = Vector{Vector{TileSummary}}(undef, length(regions))
+    Threads.@threads :dynamic for k in eachindex(regions)
+        region = regions[k]
+        chromlen = chrom_length(fa, region.chrom)
+        rs, re = sim_region(region, fmax, chromlen)
+        seq = fetch_seq(fa, region.chrom, rs, re)
         rows = TileSummary[]
         for L in Ls
-            p1, p2 = fastq_paths(outdir, locus.id, L)
+            p1, p2 = fastq_paths(outdir, region.id, L)
             with_gzip(p1) do io1
                 with_gzip(p2) do io2
-                    append!(rows, tile_locus!(io1, io2, locus, seq, rs, chromlen, L, Fs, step;
+                    append!(rows, tile_locus!(io1, io2, region, seq, rs, chromlen, L, Fs, step;
                                               qual, orientations=orients))
                 end
             end
         end
         results[k] = rows
-        @info "Tiled $(locus.id)" pairs = sum(r -> r.n_pairs, rows) skipped_N = sum(r -> r.n_skipped_N, rows)
+        @info "Tiled $(region.id)" pairs = sum(r -> r.n_pairs, rows) skipped_N = sum(r -> r.n_skipped_N, rows)
     end
     # not named `rows`: that would make the threaded closure's `rows` a shared variable
     all_rows = reduce(vcat, results)
 
     write_loci(joinpath(outdir, "loci.tsv"), loci)
     write_loci_bed(joinpath(outdir, "loci.bed"), loci)
+    write_loci(joinpath(outdir, "regions.tsv"), regions)
     write_tiling(joinpath(outdir, "tiling.tsv"), all_rows)
     meta = Dict{String,Any}(
         "unimap" => Dict("version" => string(pkgversion(@__MODULE__)), "git_commit" => git_commit(),
@@ -224,8 +231,9 @@ function simulate(fa::IndexedFasta, loci::AbstractVector{Locus}, outdir::Abstrac
         "reference" => Dict("fasta" => abspath(fa.path), "sha256" => sha),
         "grid" => Dict("read_lengths" => Ls, "fragment_lengths" => Fs, "step" => step,
                        "orientation" => orientation, "quality_char" => string(qual)),
-        "output" => Dict("n_loci" => length(loci), "n_pairs_per_L" => Dict(string(L) => sum(r.n_pairs for r in all_rows if r.L == L) for L in Ls),
-                         "read_name_format" => "locusID|chrom|fragStart0|F|orient"),
+        "output" => Dict("n_loci" => length(loci), "n_regions" => length(regions),
+                         "n_pairs_per_L" => Dict(string(L) => sum(r.n_pairs for r in all_rows if r.L == L) for L in Ls),
+                         "read_name_format" => "regionID|chrom|fragStart0|F|orient"),
         "provenance" => provenance,
     )
     open(io -> TOML.print(io, meta), joinpath(outdir, "simulate.toml"), "w")

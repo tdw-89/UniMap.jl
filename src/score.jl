@@ -74,14 +74,33 @@ function classify_pair(m1::Union{Nothing,Mate}, m2::Union{Nothing,Mate}, origin,
     return ST_WRONG
 end
 
+const Intervals = Dict{String,Vector{Tuple{Int,Int,Int}}}
+const NO_INTERVALS = Tuple{Int,Int,Int}[]
+
+function interval_index(ls::AbstractVector{Locus})
+    d = Intervals()
+    for (k, l) in enumerate(ls)
+        push!(get!(Vector{Tuple{Int,Int,Int}}, d, l.chrom), (l.start0, l.end0, k))
+    end
+    return d
+end
+
 """Target locus with the largest overlap with `[s0, e0)` on `chrom`, or 0."""
-function dest_locus(bychrom::Dict{String,Vector{Tuple{Int,Int,Int}}}, chrom::AbstractString, s0::Int, e0::Int)
+function dest_locus(bychrom::Intervals, chrom::AbstractString, s0::Int, e0::Int)
     best, best_ov = 0, 0
-    for (ls, le, k) in get(bychrom, chrom, Tuple{Int,Int,Int}[])
+    for (ls, le, k) in get(bychrom, chrom, NO_INTERVALS)
         ov = min(le, e0) - max(ls, s0)
         ov > best_ov && ((best, best_ov) = (k, ov))
     end
     return best
+end
+
+"""A misplaced proper pair landing on a simulation region: covers region-relative bases `a:b-1`."""
+struct Landing
+    a::Int32
+    b::Int32
+    j::Int32   # fragment-length index
+    q::UInt8   # fragment MAPQ
 end
 
 mutable struct ScanStats
@@ -93,17 +112,20 @@ end
 
 struct ScoreContext
     loci::Vector{Locus}
-    locus_index::Dict{String,Int}
+    regions::Vector{Locus}
+    region_index::Dict{String,Int}
     Fidx::Dict{Int,Int}
-    bychrom::Dict{String,Vector{Tuple{Int,Int,Int}}}
+    locus_bychrom::Intervals
+    region_bychrom::Intervals
     tolerance::Int
     mapq_rule::Function
 end
 
-function record_pair!(frags, ctx::ScoreContext, refnames, name::AbstractString, m1, m2, bleed, sites, stats)
+function record_pair!(frags, ctx::ScoreContext, refnames, name::AbstractString, m1, m2,
+                      bleed, sites, landings, stats)
     o = parse_read_name(name)
-    k = get(ctx.locus_index, o.locus_id, 0)
-    k == 0 && error("read '$name' names locus '$(o.locus_id)', which is not in loci.tsv")
+    k = get(ctx.region_index, o.region_id, 0)
+    k == 0 && error("read '$name' names region '$(o.region_id)', which is not in regions.tsv")
     j = get(ctx.Fidx, o.F, 0)
     s = j == 0 ? 0 : frag_slot(frags[k], j, o.frag_start0, o.orient)
     s == 0 && error("read '$name' does not match the simulation tiling (different simulate run?)")
@@ -122,20 +144,28 @@ function record_pair!(frags, ctx::ScoreContext, refnames, name::AbstractString, 
     lf.mapq[s] = q
     if st == ST_WRONG
         left0 = min(m1.pos0, m2.pos0)
+        e0 = left0 + abs(m1.tlen)
         chrom = refnames[m1.refid]
-        d = dest_locus(ctx.bychrom, chrom, left0, left0 + abs(m1.tlen))
-        key = (k, d, o.F, Int(q))
+        for (rs, re, r) in get(ctx.region_bychrom, chrom, NO_INTERVALS)
+            (rs < e0 && left0 < re) || continue
+            push!(landings[r], Landing(max(left0, rs) - rs + 1, min(e0, re) - rs + 1, j, q))
+        end
+        org = dest_locus(ctx.locus_bychrom, o.chrom, o.frag_start0, o.frag_start0 + o.F)
+        org == 0 && return
+        d = dest_locus(ctx.locus_bychrom, chrom, left0, e0)
+        key = (org, d, o.F, Int(q))
         bleed[key] = get(bleed, key, 0) + 1
-        skey = (k, m1.refid, div(left0, SITE_BIN), d, Int(q))
+        skey = (org, m1.refid, div(left0, SITE_BIN), d, Int(q))
         sites[skey] = get(sites, skey, 0) + 1
     end
     return
 end
 
 """
-    scan_bam!(frags, ctx, bam) -> (stats, bleed, sites, refnames)
+    scan_bam!(frags, ctx, bam) -> (stats, bleed, sites, landings, refnames)
 
 Single pass over an unsorted (name-grouped) BAM. Secondary/supplementary records are ignored.
+`landings[r]` lists misplaced pairs that landed on region `r`.
 """
 function scan_bam!(frags::Vector{LocusFrags}, ctx::ScoreContext, bam::AbstractString)
     reader = BAM.Reader(open(bam))
@@ -144,6 +174,7 @@ function scan_bam!(frags::Vector{LocusFrags}, ctx::ScoreContext, bam::AbstractSt
     stats = ScanStats(0, 0, 0, 0)
     bleed = Dict{NTuple{4,Int},Int}()
     sites = Dict{NTuple{5,Int},Int}()
+    landings = [Landing[] for _ in ctx.regions]
     cur = ""
     m1::Union{Nothing,Mate} = nothing
     m2::Union{Nothing,Mate} = nothing
@@ -155,7 +186,7 @@ function scan_bam!(frags::Vector{LocusFrags}, ctx::ScoreContext, bam::AbstractSt
             fl & 0x900 == 0 || continue
             name = BAM.tempname(rec)
             if name != cur
-                isempty(cur) || record_pair!(frags, ctx, refnames, cur, m1, m2, bleed, sites, stats)
+                isempty(cur) || record_pair!(frags, ctx, refnames, cur, m1, m2, bleed, sites, landings, stats)
                 cur, m1, m2 = name, nothing, nothing
             end
             if fl & 0x40 != 0
@@ -164,13 +195,13 @@ function scan_bam!(frags::Vector{LocusFrags}, ctx::ScoreContext, bam::AbstractSt
                 m2 = Mate(rec)
             end
         end
-        isempty(cur) || record_pair!(frags, ctx, refnames, cur, m1, m2, bleed, sites, stats)
+        isempty(cur) || record_pair!(frags, ctx, refnames, cur, m1, m2, bleed, sites, landings, stats)
     finally
         close(reader)
     end
     stats.duplicate > 0 && error("$bam: $(stats.duplicate) read pairs appear more than once or are not " *
                                  "adjacent; use the unsorted bowtie2 output (do not coordinate-sort it)")
-    return stats, bleed, sites, refnames
+    return stats, bleed, sites, landings, refnames
 end
 
 pushrow!(t::NamedTuple, row::NamedTuple) = (foreach(k -> push!(t[k], row[k]), keys(t)); t)
@@ -179,34 +210,103 @@ appendcols!(t::NamedTuple, u::NamedTuple) = (foreach(k -> append!(t[k], u[k]), k
 new_summary() = (locus_id=String[], chrom=String[], L=Int32[], F=Int32[], mapq_cutoff=Int32[],
                  n_fragments=Int64[], n_skipped_N=Int64[], n_missing=Int64[], n_not_proper=Int64[],
                  n_kept=Int64[], n_correct_kept=Int64[], n_wrong_kept=Int64[],
-                 frac_wrong_kept=Float64[], frac_correct=Float64[], min_denominator=Int32[])
+                 frac_wrong_kept=Float64[], frac_correct=Float64[], n_ectopic_landed=Int64[],
+                 min_denominator=Int32[])
 new_bleed() = (origin_locus=String[], dest_locus=String[], L=Int32[], F=Int32[], mapq_cutoff=Int32[],
                n_fragments=Int64[])
 new_sites() = (origin_locus=String[], L=Int32[], dest_chrom=String[], dest_bin_start0=Int64[],
                dest_bin_end0=Int64[], dest_locus=String[], fragment_mapq=Int32[], n_fragments=Int64[])
 
 """
-    locus_scores!(summary, sc, dn, locus, lf, L, Fs, cutoffs)
+    region_tracks!(ns, nc, ne, region, lf, landings, Fs, cutoffs)
 
-Fragment-span coverage via difference arrays: the denominator counts every simulated
-fragment covering a position; the numerator for cutoff c counts those that mapped
-correctly with fragment MAPQ ≥ c. Fills per-base `sc[x, F, cutoff]` (NaN where nothing
-was simulated) and `dn[x, F]`, and appends per-F summaries. Returns per-(F, cutoff)
-totals for the genome-wide summary.
+Per-base fragment-span counts for one simulation region (difference arrays):
+
+- `ns[x, F]`: simulated fragments covering x
+- `nc[x, F, c]`: of those, placed back correctly with fragment MAPQ ≥ c
+- `ne[x, F, c]`: misplaced fragments from any simulated region that landed on x with MAPQ ≥ c
 """
-function locus_scores!(summary, sc::AbstractArray{Float32,3}, dn::AbstractMatrix{UInt16}, locus::Locus,
-                       lf::LocusFrags, L::Integer, Fs::AbstractVector{<:Integer}, cutoffs::AbstractVector{<:Integer})
-    n, nc = length(locus), length(cutoffs)
+function region_tracks!(ns::AbstractMatrix{UInt16}, nc::AbstractArray{UInt16,3}, ne::AbstractArray{UInt32,3},
+                        region::Locus, lf::LocusFrags, landings::AbstractVector{Landing},
+                        Fs::AbstractVector{<:Integer}, cutoffs::AbstractVector{<:Integer})
+    n, ncut, no = length(region), length(cutoffs), length(lf.orients)
     den = zeros(Int32, n + 1)
-    num = zeros(Int32, n + 1, nc)
-    totals = Dict{Tuple{Int,Int},NTuple{7,Int}}()
+    num = zeros(Int32, n + 1, ncut)
+    foreign = zeros(Int32, n + 1, ncut)
     for (j, F) in enumerate(Fs)
         fill!(den, 0)
         fill!(num, 0)
-        nfrag = nskip = nmiss = nnp = 0
-        kept_ok, kept_wrong = zeros(Int, nc), zeros(Int, nc)
-        no = length(lf.orients)
+        fill!(foreign, 0)
         for (i, f0) in enumerate(lf.starts[j]), o in 1:no
+            s = lf.offsets[j] + no * (i - 1) + o
+            st = lf.status[s]
+            st == ST_SKIPPED && continue
+            a = max(f0, region.start0) - region.start0 + 1
+            b = min(f0 + F, region.end0) - region.start0 + 1
+            den[a] += 1
+            den[b] -= 1
+            st == ST_CORRECT || continue
+            for c in 1:ncut
+                lf.mapq[s] >= cutoffs[c] || continue
+                num[a, c] += 1
+                num[b, c] -= 1
+            end
+        end
+        for ev in landings
+            ev.j == j || continue
+            for c in 1:ncut
+                ev.q >= cutoffs[c] || continue
+                foreign[ev.a, c] += 1
+                foreign[ev.b, c] -= 1
+            end
+        end
+        ns[:, j] .= view(cumsum!(den, den), 1:n)
+        for c in 1:ncut
+            nc[:, j, c] .= view(cumsum!(view(num, :, c), view(num, :, c)), 1:n)
+            ne[:, j, c] .= view(cumsum!(view(foreign, :, c), view(foreign, :, c)), 1:n)
+        end
+    end
+    return ns, nc, ne
+end
+
+"""
+    map_back(n_correct, n_simulated)
+
+Pr(map-back) = correct / simulated: the fraction of fragments from a base that come back
+to it with MAPQ ≥ c. NaN where nothing was simulated.
+"""
+map_back(nc, ns) = ns == 0 ? NaN32 : Float32(nc / ns)
+
+"""
+    ectopic_rate(n_ectopic, n_simulated)
+
+Ex-map rate | other loci: misplaced fragments from the simulated panel landing on a base
+per fragment simulated there. A rate, not a probability; can exceed 1.
+"""
+ectopic_rate(ne, ns) = ns == 0 ? NaN32 : Float32(ne / ns)
+
+const LOG_RATIO_PSEUDOCOUNT = 0.5
+
+"""
+    log2_ratio(n_correct, n_ectopic; pseudocount=0.5)
+
+log2((correct + p) / (ectopic + p)) = log2(map_back / ectopic_rate), the log2 odds that a
+kept fragment at the base is native. 0 means as many ectopic as native fragments; NaN
+when neither count has anything. With no ectopic fragments the value is a lower bound
+that grows with the correct count.
+"""
+log2_ratio(nc, ne; pseudocount=LOG_RATIO_PSEUDOCOUNT) =
+    nc == 0 && ne == 0 ? NaN32 : Float32(log2((nc + pseudocount) / (ne + pseudocount)))
+
+"""Fate counts of fragments in `lf` with length index `j` that overlap `[s0, e0)`, per cutoff."""
+function count_fragments(lf::LocusFrags, j::Integer, F::Integer, s0::Integer, e0::Integer,
+                         cutoffs::AbstractVector{<:Integer})
+    nc, no = length(cutoffs), length(lf.orients)
+    nfrag = nskip = nmiss = nnp = 0
+    ok, wrong = zeros(Int, nc), zeros(Int, nc)
+    for (i, f0) in enumerate(lf.starts[j])
+        (f0 < e0 && f0 + F > s0) || continue
+        for o in 1:no
             s = lf.offsets[j] + no * (i - 1) + o
             st = lf.status[s]
             if st == ST_SKIPPED
@@ -214,44 +314,71 @@ function locus_scores!(summary, sc::AbstractArray{Float32,3}, dn::AbstractMatrix
                 continue
             end
             nfrag += 1
-            a = max(f0, locus.start0) - locus.start0 + 1
-            b = min(f0 + F, locus.end0) - locus.start0 + 1
-            den[a] += 1
-            den[b] -= 1
             if st == ST_MISSING
                 nmiss += 1
             elseif st == ST_NOT_PROPER
                 nnp += 1
             else
-                q = lf.mapq[s]
                 for c in 1:nc
-                    q >= cutoffs[c] || continue
-                    if st == ST_CORRECT
-                        kept_ok[c] += 1
-                        num[a, c] += 1
-                        num[b, c] -= 1
-                    else
-                        kept_wrong[c] += 1
-                    end
+                    lf.mapq[s] >= cutoffs[c] || continue
+                    st == ST_CORRECT ? (ok[c] += 1) : (wrong[c] += 1)
                 end
             end
         end
-        cumsum!(den, den)
-        mind = n > 0 ? Int(minimum(view(den, 1:n))) : 0
-        dn[:, j] .= view(den, 1:n)
-        for c in 1:nc
-            col = view(num, :, c)
-            cumsum!(col, col)
-            for x in 1:n
-                sc[x, j, c] = den[x] == 0 ? NaN32 : Float32(col[x] / den[x])
-            end
-            kept = kept_ok[c] + kept_wrong[c]
-            pushrow!(summary, (locus_id=locus.id, chrom=locus.chrom, L=Int32(L), F=Int32(F),
-                               mapq_cutoff=Int32(cutoffs[c]), n_fragments=nfrag, n_skipped_N=nskip,
-                               n_missing=nmiss, n_not_proper=nnp, n_kept=kept, n_correct_kept=kept_ok[c],
-                               n_wrong_kept=kept_wrong[c], frac_wrong_kept=kept == 0 ? NaN : kept_wrong[c] / kept,
-                               frac_correct=nfrag == 0 ? NaN : kept_ok[c] / nfrag, min_denominator=Int32(mind)))
-            totals[(F, cutoffs[c])] = (nfrag, nskip, nmiss, nnp, kept_ok[c], kept_wrong[c], mind)
+    end
+    return (; nfrag, nskip, nmiss, nnp, ok, wrong)
+end
+
+function push_summary!(summary, id, chrom, L, F, cutoffs, n, ectopic, mind)
+    for (c, cut) in enumerate(cutoffs)
+        kept = n.ok[c] + n.wrong[c]
+        pushrow!(summary, (locus_id=id, chrom=chrom, L=Int32(L), F=Int32(F), mapq_cutoff=Int32(cut),
+                           n_fragments=n.nfrag, n_skipped_N=n.nskip, n_missing=n.nmiss, n_not_proper=n.nnp,
+                           n_kept=kept, n_correct_kept=n.ok[c], n_wrong_kept=n.wrong[c],
+                           frac_wrong_kept=kept == 0 ? NaN : n.wrong[c] / kept,
+                           frac_correct=n.nfrag == 0 ? NaN : n.ok[c] / n.nfrag,
+                           n_ectopic_landed=ectopic[c], min_denominator=Int32(mind)))
+    end
+end
+
+"""Misplaced fragments of length index `j` landing on region rows `rows`, per cutoff."""
+function count_landings(landings::AbstractVector{Landing}, j::Integer, rows::AbstractUnitRange, cutoffs)
+    out = zeros(Int, length(cutoffs))
+    for ev in landings
+        (ev.j == j && ev.a <= last(rows) && ev.b > first(rows)) || continue
+        for (c, cut) in enumerate(cutoffs)
+            ev.q >= cut && (out[c] += 1)
+        end
+    end
+    return out
+end
+
+"""Rows of `region`'s tracks that belong to `locus`."""
+locus_rows(locus::Locus, region::Locus) = locus.start0-region.start0+1:locus.end0-region.start0
+
+"""
+    region_summaries!(summary, region, members, lf, landings, ns, L, Fs, cutoffs) -> totals
+
+Per-locus summary rows (fragments overlapping each member locus) and per-(F, cutoff)
+totals over the whole region for the genome-wide rows (each fragment counted once).
+"""
+function region_summaries!(summary, region::Locus, members::AbstractVector{Locus}, lf::LocusFrags,
+                           landings::AbstractVector{Landing}, ns::AbstractMatrix{UInt16}, L, Fs, cutoffs)
+    totals = Dict{Tuple{Int,Int},NTuple{8,Int}}()
+    for (j, F) in enumerate(Fs)
+        minds = Int[]
+        for l in members
+            rows = locus_rows(l, region)
+            mind = Int(minimum(view(ns, rows, j)))
+            push!(minds, mind)
+            push_summary!(summary, l.id, l.chrom, L, F, cutoffs,
+                          count_fragments(lf, j, F, l.start0, l.end0, cutoffs),
+                          count_landings(landings, j, rows, cutoffs), mind)
+        end
+        n = count_fragments(lf, j, F, region.start0, region.end0, cutoffs)
+        ect = count_landings(landings, j, 1:length(region), cutoffs)
+        for (c, cut) in enumerate(cutoffs)
+            totals[(F, cut)] = (n.nfrag, n.nskip, n.nmiss, n.nnp, n.ok[c], n.wrong[c], ect[c], minimum(minds))
         end
     end
     return totals
@@ -260,14 +387,14 @@ end
 function genome_wide_rows!(summary, L, all_totals)
     for key in sort!(collect(keys(first(all_totals))))
         t = [tot[key] for tot in all_totals]
-        nfrag, nskip, nmiss, nnp, ok, wrong = (sum(x[i] for x in t) for i in 1:6)
+        nfrag, nskip, nmiss, nnp, ok, wrong, ect = (sum(x[i] for x in t) for i in 1:7)
         kept = ok + wrong
         pushrow!(summary, (locus_id="ALL", chrom="", L=Int32(L), F=Int32(key[1]), mapq_cutoff=Int32(key[2]),
                            n_fragments=nfrag, n_skipped_N=nskip, n_missing=nmiss, n_not_proper=nnp,
                            n_kept=kept, n_correct_kept=ok, n_wrong_kept=wrong,
                            frac_wrong_kept=kept == 0 ? NaN : wrong / kept,
-                           frac_correct=nfrag == 0 ? NaN : ok / nfrag,
-                           min_denominator=Int32(minimum(x[7] for x in t))))
+                           frac_correct=nfrag == 0 ? NaN : ok / nfrag, n_ectopic_landed=ect,
+                           min_denominator=Int32(minimum(x[8] for x in t))))
     end
 end
 
@@ -340,53 +467,62 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
 
     fa = IndexedFasta(something(fasta, meta["reference"]["fasta"]))
     loci = read_loci(joinpath(simdir, "loci.tsv"))
+    regions_tsv = joinpath(simdir, "regions.tsv")
+    isfile(regions_tsv) || error("$regions_tsv not found; re-run `unimap simulate` with this version")
+    regions = read_loci(regions_tsv)
+    locus_index = Dict(l.id => k for (k, l) in enumerate(loci))
+    members = [[loci[locus_index[id]] for id in region_members(r)] for r in regions]
     tiling = read_tiling(joinpath(simdir, "tiling.tsv"))
     checksum = meta["reference"]["sha256"]
-    bychrom = Dict{String,Vector{Tuple{Int,Int,Int}}}()
-    for (k, l) in enumerate(loci)
-        push!(get!(Vector{Tuple{Int,Int,Int}}, bychrom, l.chrom), (l.start0, l.end0, k))
-    end
-    ctx = ScoreContext(loci, Dict(l.id => k for (k, l) in enumerate(loci)),
-                       Dict(F => j for (j, F) in enumerate(Fs)), bychrom, tolerance, rule)
+    ctx = ScoreContext(loci, regions, Dict(r.id => k for (k, r) in enumerate(regions)),
+                       Dict(F => j for (j, F) in enumerate(Fs)), interval_index(loci), interval_index(regions),
+                       tolerance, rule)
 
     fmax = maximum(Fs)
     2fmax <= typemax(UInt16) || error("fragment length $fmax is too large for UInt16 denominators")
-    regions = [sim_region(l, fmax, chrom_length(fa, l.chrom)) for l in loci]
-    seqs = [fetch_seq(fa, l.chrom, r...) for (l, r) in zip(loci, regions)]
+    padded = [sim_region(r, fmax, chrom_length(fa, r.chrom)) for r in regions]
+    seqs = [fetch_seq(fa, r.chrom, p...) for (r, p) in zip(regions, padded)]
 
     mkpath(out)
     zpath = joinpath(out, "mappability.zarr")
     store = create_track_store(zpath, loci, Ls, Fs, cutoffs;
                                attrs=Dict("genome_checksum" => checksum, "fragment_mapq_rule" => frag_mapq,
                                           "tolerance" => tolerance, "step" => tile_step,
-                                          "orientation" => grid["orientation"]))
+                                          "orientation" => grid["orientation"],
+                                          "precision_sources" => [r.id for r in regions]))
     zlock = ReentrantLock()
 
     results = Vector{Any}(undef, length(Ls))
-    @info "Scoring $(length(loci)) loci" read_lengths = join(Ls, ",") cutoffs = join(cutoffs, ",") threads = Threads.nthreads()
+    @info "Scoring $(length(loci)) loci in $(length(regions)) regions" read_lengths = join(Ls, ",") cutoffs = join(cutoffs, ",") threads = Threads.nthreads()
     Threads.@threads :dynamic for t in eachindex(Ls)
         L = Ls[t]
-        frags = [LocusFrags(l, seqs[k], regions[k][1], chrom_length(fa, l.chrom), L, Fs, tile_step, orients)
-                 for (k, l) in enumerate(loci)]
-        for (k, l) in enumerate(loci), (j, F) in enumerate(Fs)
-            exp = get(tiling, (l.id, L, F), nothing)
-            exp === nothing && error("tiling.tsv has no row for ($(l.id), L=$L, F=$F)")
+        frags = [LocusFrags(r, seqs[k], padded[k][1], chrom_length(fa, r.chrom), L, Fs, tile_step, orients)
+                 for (k, r) in enumerate(regions)]
+        for (k, r) in enumerate(regions), (j, F) in enumerate(Fs)
+            exp = get(tiling, (r.id, L, F), nothing)
+            exp === nothing && error("tiling.tsv has no row for ($(r.id), L=$L, F=$F)")
             lf = frags[k]
             got = (length(lf.starts[j]),
                    count(==(ST_SKIPPED), view(lf.status, lf.offsets[j]+1:lf.offsets[j+1])) ÷ length(orients))
-            exp == got || error("tiling mismatch for ($(l.id), L=$L, F=$F): simulate wrote (starts, N-skipped) = " *
+            exp == got || error("tiling mismatch for ($(r.id), L=$L, F=$F): simulate wrote (starts, N-skipped) = " *
                                 "$exp, rescoring expects $got; was the reference changed?")
         end
-        stats, bleed, sites, refnames = scan_bam!(frags, ctx, bams[L])
+        stats, bleed, sites, landings, refnames = scan_bam!(frags, ctx, bams[L])
         summary, bleed_tbl, sites_tbl = new_summary(), new_bleed(), new_sites()
-        totals = map(enumerate(loci)) do (k, l)
-            sc = Array{Float32}(undef, length(l), length(Fs), length(cutoffs))
-            dn = Matrix{UInt16}(undef, length(l), length(Fs))
-            tot = locus_scores!(summary, sc, dn, l, frags[k], L, Fs, cutoffs)
-            rows = store.offsets[k]+1:store.offsets[k+1]
+        totals = map(enumerate(regions)) do (k, r)
+            ns = Matrix{UInt16}(undef, length(r), length(Fs))
+            ncor = Array{UInt16}(undef, length(r), length(Fs), length(cutoffs))
+            nect = Array{UInt32}(undef, length(r), length(Fs), length(cutoffs))
+            region_tracks!(ns, ncor, nect, r, frags[k], landings[k], Fs, cutoffs)
+            tot = region_summaries!(summary, r, members[k], frags[k], landings[k], ns, L, Fs, cutoffs)
             lock(zlock) do
-                store.score[rows, :, :, t] = sc
-                store.denominator[rows, :, t] = dn
+                for l in members[k]
+                    i = locus_index[l.id]
+                    rows, rr = store.offsets[i]+1:store.offsets[i+1], locus_rows(l, r)
+                    store.n_simulated[rows, :, t] = ns[rr, :]
+                    store.n_correct[rows, :, :, t] = ncor[rr, :, :]
+                    store.n_ectopic[rows, :, :, t] = nect[rr, :, :]
+                end
             end
             tot
         end
@@ -432,16 +568,19 @@ end
 const CHUNK_POSITIONS = 16_384
 
 """
-    create_track_store(path, loci, Ls, Fs, cutoffs; attrs) -> (; group, score, denominator, offsets)
+    create_track_store(path, loci, Ls, Fs, cutoffs; attrs) -> (; group, n_simulated, n_correct, n_ectopic, offsets)
 
-Zarr (v2) group holding per-base tracks for all loci concatenated end to end:
+Zarr (v2) group holding per-base fragment counts for all loci concatenated end to end:
 
-- `score[position, F, mapq_cutoff, L]`: Float32, NaN where no fragment was simulated
-- `denominator[position, F, L]`: UInt16 simulated fragments covering each base
+- `n_simulated[position, F, L]` (UInt16): simulated fragments covering the base
+- `n_correct[position, F, mapq_cutoff, L]` (UInt16): of those, placed back correctly with MAPQ ≥ cutoff
+- `n_ectopic[position, F, mapq_cutoff, L]` (UInt32): misplaced fragments from the simulated
+  panel that landed on the base with MAPQ ≥ cutoff
 - 1-D coordinate arrays `L`, `F`, `mapq_cutoff`
 
-Locus `k` occupies positions `offsets[k]+1:offsets[k+1]` (attribute `loci`). Dimension
-names are stored as `_ARRAY_DIMENSIONS` in C order (what xarray/zarr-python see).
+Derived quantities: `map_back`, `ectopic_rate`, `log2_ratio`. Locus `k` occupies positions
+`offsets[k]+1:offsets[k+1]` (attribute `loci`). Dimension names are stored as
+`_ARRAY_DIMENSIONS` in C order (what xarray/zarr-python see).
 """
 function create_track_store(path::AbstractString, loci::AbstractVector{Locus}, Ls, Fs, cutoffs;
                             attrs::AbstractDict=Dict{String,Any}())
@@ -454,26 +593,31 @@ function create_track_store(path::AbstractString, loci::AbstractVector{Locus}, L
                       "strand" => string(l.strand), "offset" => offsets[k]) for (k, l) in enumerate(loci)]
     gattrs = merge(Dict{String,Any}(attrs), Dict("loci" => loci_attr, "read_lengths" => collect(Int, Ls),
                    "fragment_lengths" => collect(Int, Fs), "mapq_cutoffs" => collect(Int, cutoffs),
-                   "n_positions" => npos))
+                   "n_positions" => npos, "log_ratio_pseudocount" => LOG_RATIO_PSEUDOCOUNT))
     g = zgroup(path; attrs=gattrs)
-    score = zcreate(Float32, g, "score", npos, nF, nc, nL; chunks=(chunk, nF, nc, 1), fill_value=NaN32,
-                    compressor=comp, attrs=Dict("_ARRAY_DIMENSIONS" => ["L", "mapq_cutoff", "F", "position"]))
-    den = zcreate(UInt16, g, "denominator", npos, nF, nL; chunks=(chunk, nF, 1), fill_value=UInt16(0),
-                  compressor=comp, attrs=Dict("_ARRAY_DIMENSIONS" => ["L", "F", "position"]))
+    dims4 = Dict("_ARRAY_DIMENSIONS" => ["L", "mapq_cutoff", "F", "position"])
+    n_simulated = zcreate(UInt16, g, "n_simulated", npos, nF, nL; chunks=(chunk, nF, 1), fill_value=UInt16(0),
+                          compressor=comp, attrs=Dict("_ARRAY_DIMENSIONS" => ["L", "F", "position"]))
+    n_correct = zcreate(UInt16, g, "n_correct", npos, nF, nc, nL; chunks=(chunk, nF, nc, 1),
+                        fill_value=UInt16(0), compressor=comp, attrs=dims4)
+    n_ectopic = zcreate(UInt32, g, "n_ectopic", npos, nF, nc, nL; chunks=(chunk, nF, nc, 1),
+                        fill_value=UInt32(0), compressor=comp, attrs=dims4)
     for (name, vals) in (("L", Ls), ("F", Fs), ("mapq_cutoff", cutoffs))
         z = zcreate(Int32, g, name, length(vals); attrs=Dict("_ARRAY_DIMENSIONS" => [name]))
         z[:] = Int32.(vals)
     end
-    return (; group=g, score, denominator=den, offsets)
+    return (; group=g, n_simulated, n_correct, n_ectopic, offsets)
 end
 
 """
-    locus_track(zarr, locus_id; L, F, mapq_cutoff) -> (; chrom, start0, score, denominator)
+    locus_track(zarr, locus_id; L, F, mapq_cutoff)
+        -> (; chrom, start0, n_simulated, n_correct, n_ectopic, map_back, ectopic_rate, log2_ratio)
 
-Per-base score and denominator for one locus and channel from a `mappability.zarr`
+Per-base counts and derived quantities for one locus and channel from a `mappability.zarr`
 (path or opened group). Position `i` of the vectors is genomic `start0 + i - 1` (0-based).
 """
 function locus_track(g::Zarr.ZGroup, locus_id::AbstractString; L::Integer, F::Integer, mapq_cutoff::Integer)
+    haskey(g.arrays, "n_correct") || error("store has no count arrays; re-run `unimap score` with this version")
     loci = g.attrs["loci"]
     k = findfirst(l -> l["locus_id"] == locus_id, loci)
     k === nothing && error("locus '$locus_id' is not in this store")
@@ -482,8 +626,13 @@ function locus_track(g::Zarr.ZGroup, locus_id::AbstractString; L::Integer, F::In
     (iL == 0 || iF == 0 || ic == 0) && error("(L=$L, F=$F, mapq_cutoff=$mapq_cutoff) is not on the stored grid")
     l = loci[k]
     rows = l["offset"]+1:l["offset"]+l["end0"]-l["start0"]
-    return (; chrom=l["chrom"], start0=l["start0"], score=g["score"][rows, iF, ic, iL],
-            denominator=g["denominator"][rows, iF, iL])
+    ns = g["n_simulated"][rows, iF, iL]
+    nc = g["n_correct"][rows, iF, ic, iL]
+    ne = g["n_ectopic"][rows, iF, ic, iL]
+    pc = get(g.attrs, "log_ratio_pseudocount", LOG_RATIO_PSEUDOCOUNT)
+    return (; chrom=l["chrom"], start0=l["start0"], n_simulated=ns, n_correct=nc, n_ectopic=ne,
+            map_back=map_back.(nc, ns), ectopic_rate=ectopic_rate.(ne, ns),
+            log2_ratio=log2_ratio.(nc, ne; pseudocount=pc))
 end
 
 locus_track(path::AbstractString, locus_id::AbstractString; kw...) = locus_track(zopen(path), locus_id; kw...)

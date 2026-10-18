@@ -14,8 +14,28 @@ function cli_settings()
             help = "write a bash script that aligns the simulated reads with bowtie2"
             action = :command
         "score"
-            help = "classify aligned simulated pairs and write mappability tracks (Parquet)"
+            help = "classify aligned simulated pairs; write per-base tracks (Zarr) and summaries (Parquet)"
             action = :command
+        "view"
+            help = "interactive 3-D viewer of per-base mappability (GLMakie window)"
+            action = :command
+    end
+
+    @add_arg_table! s["view"] begin
+        "zarr"
+            help = "path to scores/mappability.zarr, or a `simulate` directory containing scores/"
+            required = true
+        "--locus"
+            help = "locus to show first"
+        "--read-lengths", "-L"
+            help = "read lengths to show (default: all in the store)"
+        "--plot", "-p"
+            help = "base (metric over fragment length x MAPQ cutoff at one base), track (over position x fragment length at one cutoff) or boxplot (distribution across bases per fragment length at one cutoff)"
+            default = "base"
+        "--cutoff", "-c"
+            help = "MAPQ cutoff shown first by the track and boxplot views"
+            arg_type = Int
+            default = 2
     end
 
     @add_arg_table! s["align-script"] begin
@@ -193,6 +213,12 @@ function (@main)(argv)
         cmd_align_script(sub)
     elseif cmd == "score"
         cmd_score(sub)
+    elseif cmd == "view"
+        path = sub["zarr"]
+        endswith(rstrip(path, '/'), ".zarr") || (path = joinpath(path, "scores", "mappability.zarr"))
+        Ls = sub["read-lengths"] === nothing ? nothing : parse_int_list(sub["read-lengths"])
+        view_mappability(path; locus=sub["locus"], read_lengths=Ls, plot=Symbol(sub["plot"]),
+                         mapq_cutoff=sub["cutoff"])
     end
     return 0
 end

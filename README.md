@@ -52,6 +52,9 @@ bash sim/align.sh
 
 # 4. Score
 unimap score -s sim/
+
+# 5. Explore interactively (opens a GLMakie window)
+unimap view sim/
 ```
 
 Results are written to `sim/scores/`: per-base tracks in a Zarr store and summary tables
@@ -78,7 +81,7 @@ A fragment of length F starting at position `s` gives two mates of length `m = m
 - Fragments with a non-ACGT base in either mate are skipped and excluded from the
   denominator.
 - Each read name records where the fragment came from:
-  `locusID|chrom|fragStart0|F|orient`, with 0-based coordinates.
+  `regionID|chrom|fragStart0|F|orient`, with 0-based coordinates.
 
 ### Grid
 
@@ -112,29 +115,73 @@ Read lengths (`-L`) and fragment lengths (`-F`) are both explicit lists with no 
 - A BED file (`-l loci.bed`) is used as-is, with no flanks added.
 - Only positions inside the locus are scored. UniMap simulates every fragment that
   overlaps the locus, so edge positions get full coverage.
+- **Simulation regions.** Loci that overlap, or sit close enough to share a fragment
+  (gap ≤ largest F − 2), are merged into one simulation region, e.g.
+  `klhl10b.1+klhl10b.2`. This way each genomic fragment is simulated and counted once.
+  Outputs are still reported per locus, cut out of the region's tracks, so overlapping
+  loci show identical values where they overlap.
 
 ### Scoring
 
-For position x, read length L, fragment length F and MAPQ cutoff c:
-
-$$m_c(x, L, F) = \frac{\#\{\text{fragments covering } x \text{ that map correctly with fragment MAPQ} \ge c\}}{\#\{\text{simulated fragments covering } x\}}$$
-
-A fragment covers every base from its leftmost to its rightmost position, which is the
-same span MACS3 `BAMPE` piles up. Each simulated pair is classified as:
+Each simulated pair is classified as:
 
 - **correct**: a primary proper pair on the origin chromosome. Its leftmost position and
   fragment length must be within `--tolerance` of the origin (default 0), and R1 must
   be on the expected strand.
-- **wrong locus**: a proper pair placed somewhere else. These feed the bleed matrix and
-  the misplaced-sites table.
+- **misplaced**: a proper pair placed anywhere else, whether on another locus, elsewhere
+  in the same locus, or off the panel. These also feed the bleed matrix and the
+  misplaced-sites table.
 - **not proper**: unaligned, discordant, or only one mate aligned.
 
 **Fragment MAPQ** is the lower MAPQ of the two mates (`--frag-mapq min`, the default; `max`
 is also available). Use the same rule when counting real reads.
 
+A fragment covers every base from its leftmost to its rightmost position, which is the
+same span MACS3 `BAMPE` piles up. For each base y, read length L, fragment length F and
+MAPQ cutoff c, UniMap stores three **counts**:
+
+| count | meaning |
+|---|---|
+| `n_simulated` | simulated fragments covering y |
+| `n_correct` | of those, placed back correctly with MAPQ at or above c |
+| `n_ectopic` | misplaced fragments from any simulated locus that landed on y with MAPQ at or above c |
+
+Three quantities are derived from the counts (`map_back`, `ectopic_rate`, `log2_ratio`):
+
+1. **Pr(map-back)** = `n_correct / n_simulated`. The probability that a fragment from y
+   comes back to y and passes the cutoff. Everything else (misplaced, not proper,
+   below the cutoff) counts as lost. It can only fall as c rises.
+2. **Ex-map rate | o.l.** = `n_ectopic / n_simulated`. Ectopic fragments landing on y per
+   fragment simulated at y, given the other loci (o.l.) in the simulation. This is a
+   rate, not a probability, and can exceed 1 when several copies feed one locus.
+3. **log2(map-back / ex-map rate)** = `log2((n_correct + p) / (n_ectopic + p))`, with
+   pseudocount p = 0.5. This is the log2 odds that a kept fragment at y is native.
+   - 0 means as many ectopic as native fragments. It is undefined (NaN) when neither
+     count has anything.
+   - With no ectopic fragments it is only a lower bound, log2(2 n_correct + 1), so it
+     tracks how many fragments were simulated (more for longer F, smaller `--step`, or
+     both orientations) rather than the true, unbounded odds.
+   - +3 means 8 native fragments per ectopic one; negative values mean ectopic
+     fragments dominate.
+   - If one paralog carries k times the signal of another, its contribution shifts this
+     value by −log2 k.
+
+Caveats for the ex-map rate and the log ratio:
+
+- **They depend on the panel.** Only simulated loci can contribute ectopic fragments, so
+  the rate rises as more paralogs are included. Sources off the panel, such as
+  unannotated copies or transposable elements, are not counted. `misplaced_sites` shows
+  where a locus's own fragments go, which hints at such sources.
+- **They assume equal signal at every locus**, because every locus is tiled at the same
+  density.
+- Pr(map-back) at y comes from y's own fragments only, so it does not depend on the panel.
+
+Storing counts rather than ratios keeps later steps exact. For example, weighting by a
+run's fragment-length histogram should combine counts or rates, not log ratios.
+
 **Choosing a cutoff**: in `misplacement_summary`, find the lowest cutoff where
-`frac_wrong_kept` is below about 1%. In bowtie2, MAPQ 0–1 means the pair has multiple
-equally good hits.
+`frac_wrong_kept` is below about 1%, then check that Pr(map-back) is still acceptable
+there. In bowtie2, MAPQ 0–1 means the pair has multiple equally good hits.
 
 ## Commands
 
@@ -191,22 +238,57 @@ the BAMs**: scoring needs the two mates of each pair next to each other.
 Threads over read lengths. Denominators are rebuilt from the reference and checked against
 `tiling.tsv`, so pairs that are missing from the BAM still count against the score.
 
+### `unimap view`
+| option | default | |
+|---|---|---|
+| `zarr` (positional) | required | `scores/mappability.zarr`, or a `simulate` directory |
+| `--locus` | first locus | locus to open on |
+| `-L/--read-lengths` | all | read lengths to show |
+| `-p/--plot` | `base` | `base`, `track` or `boxplot` (below) |
+| `-c/--cutoff` | 2 | MAPQ cutoff shown first by `track` and `boxplot` |
+
+Opens an interactive GLMakie window with one panel per read length. Every view has a
+locus dropdown with previous/next buttons and a metric dropdown: Pr(map-back), the ex-map
+rate, or the log2 ratio. The log2 ratio uses a diverging colour scale centred at 0.
+
+- **`base`**: a 3-D surface over fragment length (x) and MAPQ cutoff (y) at one base `s`,
+  linearly interpolated between grid points. A slider moves `s` along the locus.
+- **`track`**: a 3-D surface over position along the locus (x) and fragment length (y) at
+  one MAPQ cutoff, which can be changed in the window. Undefined values are left as holes.
+  Loci longer than 8,192 bp are drawn in equal-width bins (noted in the panel title) that
+  keep the worst value in each bin, because the GPU cannot draw a surface that long.
+- **`boxplot`**: for each fragment length, a box plot of the metric across all bases of
+  the locus at one MAPQ cutoff. Undefined values (e.g. a log2 ratio with no reads either
+  way) are left out, and their share is shown in the panel title.
+
+In the `base` view:
+
+- The slider moves `s` along the locus.
+- ←/→ step ±1 bp and ↑/↓ step ±100 bp (click the figure first so it has keyboard focus).
+- The dropdown, or the ◀/▶ buttons, switch locus without rebuilding the window.
+- Plots can be rotated with the mouse.
+
+From the REPL, `view_mappability("sim/scores/mappability.zarr"; wait=false)` opens the
+same window without blocking. GLMakie is only loaded when the viewer is used, so the
+other commands, including runs on the cluster, don't need it or a display.
+
 ## Outputs
 
 **`simulate` output directory**
 | file | contents |
 |---|---|
-| `fastq/L{L}/{locus}_R{1,2}.fq.gz` | simulated pairs, all F values |
+| `fastq/L{L}/{region}_R{1,2}.fq.gz` | simulated pairs, all F values |
 | `loci.tsv`, `loci.bed` | loci used (0-based, half-open) |
-| `tiling.tsv` | per (locus, L, F): step, start range, starts, N-skipped starts, pairs written |
+| `regions.tsv` | simulation regions; the `query` column lists member loci |
+| `tiling.tsv` | per (region, L, F): step, start range, starts, N-skipped starts, pairs written |
 | `simulate.toml` | reference path and SHA-256, grid, UniMap version and git commit |
 | `align.sh`, `align.toml`, `aln/` | written by `align-script` and by running the script |
 
 **`scores/`**
 | file | contents |
 |---|---|
-| `mappability.zarr` | per-base tracks for every locus, concatenated end to end (described below) |
-| `misplacement_summary.parquet` | one row per locus × L × F × cutoff, plus genome-wide `ALL` rows: `n_fragments, n_kept, n_correct_kept, n_wrong_kept, frac_wrong_kept, frac_correct, n_not_proper, n_missing, n_skipped_N, min_denominator` |
+| `mappability.zarr` | per-base fragment counts for every locus, concatenated end to end (described below) |
+| `misplacement_summary.parquet` | one row per locus × L × F × cutoff, plus genome-wide `ALL` rows: `n_fragments, n_kept, n_correct_kept, n_wrong_kept, frac_wrong_kept, frac_correct, n_ectopic_landed, n_not_proper, n_missing, n_skipped_N, min_denominator` |
 | `bleed_matrix.parquet` | one row per origin × destination × L × F × cutoff: `origin_locus`, `dest_locus` (another target locus, or `elsewhere`), `n_fragments`. Not written if nothing was misplaced. |
 | `misplaced_sites.parquet` | one row per origin × 1 kb destination bin × fragment MAPQ: where wrong-locus pairs landed. Not written if nothing was misplaced. |
 | `score.toml` | reference checksum, bowtie2 version and arguments, scoring settings |
@@ -218,15 +300,17 @@ A Zarr v2 group. All loci are concatenated along one `position` axis, and each
 
 | array | Julia dims | Python/xarray dims | type |
 |---|---|---|---|
-| `score` | `[position, F, mapq_cutoff, L]` | `(L, mapq_cutoff, F, position)` | Float32, `NaN` where nothing was simulated |
-| `denominator` | `[position, F, L]` | `(L, F, position)` | UInt16, simulated fragments covering the base |
+| `n_simulated` | `[position, F, L]` | `(L, F, position)` | UInt16 |
+| `n_correct` | `[position, F, mapq_cutoff, L]` | `(L, mapq_cutoff, F, position)` | UInt16 |
+| `n_ectopic` | `[position, F, mapq_cutoff, L]` | `(L, mapq_cutoff, F, position)` | UInt32 |
 | `L`, `F`, `mapq_cutoff` | 1-D | 1-D | grid values |
 
 - The group attributes hold `loci`: one entry per locus with `locus_id, chrom, start0,
   end0, strand, offset`. Locus k covers positions `offset+1 : offset+(end0-start0)` in
   Julia (`offset : offset+(end0-start0)` in Python). Position `i` within a locus is
   genomic `start0 + i - 1`.
-- The attributes also hold `genome_checksum`, the grid and the scoring settings.
+- The attributes also hold `genome_checksum`, the grid, the scoring settings and
+  `log_ratio_pseudocount`.
 - Chunks are 16,384 positions × all F × all cutoffs for one L, compressed with
   Blosc/zstd. Reading one locus for one read length therefore touches only a few chunks.
 
@@ -234,16 +318,18 @@ Reading the tracks:
 
 ```julia
 using UniMap
-t = locus_track("sim/scores/mappability.zarr", "pimr158"; L=100, F=240, mapq_cutoff=2)
-t.chrom, t.start0, t.score, t.denominator   # per-base vectors
+t = locus_track("sim/scores/mappability.zarr", "pimr158"; L=100, F=200, mapq_cutoff=2)
+t.n_simulated, t.n_correct, t.n_ectopic         # per-base counts
+t.map_back, t.ectopic_rate, t.log2_ratio        # derived per-base quantities
 
-using Zarr                                   # or the whole array
+using Zarr                                       # or the whole arrays
 z = zopen("sim/scores/mappability.zarr"; consolidated=true)
-z["score"]                                   # [position, F, mapq_cutoff, L]
+z["n_correct"]                                   # [position, F, mapq_cutoff, L]
 ```
 ```python
 import xarray as xr
-ds = xr.open_zarr("sim/scores/mappability.zarr")   # ds.score.sel(L=100, F=240, mapq_cutoff=2)
+ds = xr.open_zarr("sim/scores/mappability.zarr")
+map_back = ds.n_correct / ds.n_simulated
 ```
 
 The summary tables are Parquet:
@@ -253,19 +339,12 @@ using Parquet, DataFrames
 summary = DataFrame(read_parquet("sim/scores/misplacement_summary.parquet"))
 ```
 
-## Scale
+## Parameter choices and scale
 
-On 14 zebrafish loci of about 6–27 kb each (gene plus flanks), with 17 fragment lengths
-(50–500 bp), both orientations and steps of 1–5 bp:
-
-- Simulation: about 27 pairs per base per read length, about 400k pairs per locus per
-  read length, about 7 MB of FASTQ per locus per read length, and about 13 s for 3 read
-  lengths on 8 threads.
-- Alignment dominates the runtime: bowtie2 took 7–14 min per read length (about 5.6M
-  pairs) on 8 threads against the whole genome.
-- Scoring all three read lengths took 17 s, and `mappability.zarr` is 12 MB.
-- The quick-start settings (7 fragment lengths, `--step 5`, one orientation) give
-  1.4 pairs per base per read length, about 20× fewer reads.
+Alignment dominates the runtime and scales with the number of simulated pairs. Measured
+choices of MAPQ cutoff, fragment-length grid, `--step` and orientation, with runtime and
+full-panel cost estimates, are in
+[docs/simulation_findings.md](docs/simulation_findings.md).
 
 ## Tests
 
@@ -279,7 +358,7 @@ duplicated and near-duplicated loci.
 
 ## Roadmap
 
-- Plots of mappability along a locus
+- Aggregated plots across loci
 - Per-run weighting by observed fragment-length histograms and read-length quantiles
 - SNP/error sensitivity runs, calling of unique segments with RepeatMasker filtering, and
   ATAC and bisulfite modes

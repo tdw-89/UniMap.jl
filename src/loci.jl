@@ -197,7 +197,7 @@ function locus_id_from_gene(id::AbstractString)
     for p in NCBI_ID_PREFIXES
         startswith(id, p) && (id = id[length(p)+1:end]; break)
     end
-    return replace(id, r"[\s|/]" => "_")
+    return replace(id, r"[\s|/,]" => "_")
 end
 
 """
@@ -274,6 +274,47 @@ end
 
 const LOCI_HEADER = ["locus_id", "chrom", "start0", "end0", "strand", "gene_start0", "gene_end0",
                      "query", "upstream_flank_overlaps", "downstream_flank_overlaps"]
+
+"""
+    merge_regions(loci, fmax) -> Vector{Locus}
+
+Simulation regions: loci on the same chromosome that could share a fragment of length
+≤ `fmax` (gap ≤ `fmax - 2`) are merged, so every genomic fragment is simulated and counted
+once. A region's `query` field lists its member locus IDs (comma-separated); its ID is the
+locus ID for single-locus regions, otherwise the member IDs joined by `+` (or `region<k>` if long).
+"""
+function merge_regions(loci::AbstractVector{Locus}, fmax::Integer)
+    groups = Vector{Vector{Int}}()
+    chrom, stop = "", typemin(Int)
+    for i in sortperm(loci; by=l -> (l.chrom, l.start0, l.end0))
+        l = loci[i]
+        if !isempty(groups) && l.chrom == chrom && l.start0 < stop + fmax - 1
+            push!(groups[end], i)
+            stop = max(stop, l.end0)
+        else
+            push!(groups, [i])
+            chrom, stop = l.chrom, l.end0
+        end
+    end
+    foreach(sort!, groups)
+    sort!(groups; by=first)
+    regions = Locus[]
+    for (k, g) in enumerate(groups)
+        if length(g) == 1
+            l = loci[only(g)]
+            push!(regions, Locus(l.id, l.chrom, l.start0, l.end0, '.', l.start0, l.end0, l.id, "", ""))
+            continue
+        end
+        ids = [loci[i].id for i in g]
+        id = join(ids, "+")
+        length(id) > 100 && (id = "region$k")
+        s0, e0 = minimum(loci[i].start0 for i in g), maximum(loci[i].end0 for i in g)
+        push!(regions, Locus(id, loci[first(g)].chrom, s0, e0, '.', s0, e0, join(ids, ","), "", ""))
+    end
+    return regions
+end
+
+region_members(r::Locus) = split(r.query, ',')
 
 function write_loci(path::AbstractString, loci::AbstractVector{Locus})
     open(path, "w") do io
