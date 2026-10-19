@@ -88,8 +88,10 @@ A fragment of length F starting at position `s` gives two mates of length `m = m
 Read lengths (`-L`) and fragment lengths (`-F`) are both explicit lists with no defaults.
 
 - **Read lengths**: the lengths your runs round down to, usually their 10th–25th
-  percentile post-trimming read length. Each read length is a separate bowtie2 run, so
-  list only the ones you need.
+  percentile read length after quality trimming. Take them from lengths *before* adapter
+  trimming: the simulation already shortens the reads of fragments shorter than L to F,
+  so adapter-trimmed lengths would count that trimming twice. Each read length is a
+  separate bowtie2 run, so list only the ones you need.
 - **Fragment lengths**: points spanning your runs' fragment-length histograms. They are
   later used to interpolate each run's histogram. The largest should equal the aligner's
   maximum fragment length (bowtie2 `-X`), because longer fragments can never align as
@@ -98,8 +100,11 @@ Read lengths (`-L`) and fragment lengths (`-F`) are both explicit lists with no 
 - **Tiling step** (`--step`, default 1): bp between consecutive fragment starts.
   - Pairs simulated per base per read length = (number of fragment lengths) ×
     (orientations) / step.
-  - The fragments covering a base = F × (orientations) / step.
-  - A larger step coarsens the per-base average but doesn't bias it. Keep it well below
+  - The fragments covering a base = F × (orientations) / step on average. It is exact
+    when step divides F; otherwise it alternates between the two nearest whole numbers
+    along the locus.
+  - A larger step is a systematic subsample at one phase: unbiased on average over
+    phases, but each base's value carries a phase-dependent error. Keep it well below
     the shortest read length (≤ L/5 is a safe rule), so every mate-length stretch of
     sequence is still sampled several times.
 
@@ -163,8 +168,9 @@ Three quantities are derived from the counts (`map_back`, `ectopic_rate`, `log2_
      both orientations) rather than the true, unbounded odds.
    - +3 means 8 native fragments per ectopic one; negative values mean ectopic
      fragments dominate.
-   - If one paralog carries k times the signal of another, its contribution shifts this
-     value by −log2 k.
+   - If every source of ectopic fragments at y carries k times y's signal, the value
+     shifts by −log2 k. With several sources it shifts by −log2 of their mean signal
+     ratio, weighted by how many ectopic fragments each contributes.
 
 Caveats for the ex-map rate and the log ratio:
 
@@ -176,8 +182,11 @@ Caveats for the ex-map rate and the log ratio:
   density.
 - Pr(map-back) at y comes from y's own fragments only, so it does not depend on the panel.
 
-Storing counts rather than ratios keeps later steps exact. For example, weighting by a
-run's fragment-length histogram should combine counts or rates, not log ratios.
+Storing counts rather than ratios keeps later steps exact. To weight by a run's
+fragment-length distribution, sum the counts across fragment lengths with the run's
+fragment shares (normalised to sum to 1) and then divide; never average log ratios.
+[docs/probability_model.md](docs/probability_model.md) formalises how the counts relate to
+recall and precision of real coverage, and which assumptions that needs.
 
 **Choosing a cutoff**: in `misplacement_summary`, find the lowest cutoff where
 `frac_wrong_kept` is below about 1%, then check that Pr(map-back) is still acceptable

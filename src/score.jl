@@ -290,7 +290,8 @@ const LOG_RATIO_PSEUDOCOUNT = 0.5
 """
     log2_ratio(n_correct, n_ectopic; pseudocount=0.5)
 
-log2((correct + p) / (ectopic + p)) = log2(map_back / ectopic_rate), the log2 odds that a
+`log2((correct + p) / (ectopic + p))`, which tends to `log2(map_back / ectopic_rate)` as p -> 0:
+the log2 odds that a
 kept fragment at the base is native. 0 means as many ectopic as native fragments; NaN
 when neither count has anything. With no ectopic fragments the value is a lower bound
 that grows with the correct count.
