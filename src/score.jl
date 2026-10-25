@@ -162,10 +162,12 @@ function record_pair!(frags, ctx::ScoreContext, refnames, name::AbstractString, 
 end
 
 """
-    scan_bam!(frags, ctx, bam) -> (stats, bleed, sites, landings, refnames)
+    scan_bam!(frags, ctx, bam) -> (; stats, bleed, sites, landings, refnames)
 
 Single pass over an unsorted (name-grouped) BAM. Secondary/supplementary records are ignored.
-`landings[r]` lists misplaced pairs that landed on region `r`.
+`landings[r]` lists misplaced pairs that landed on region `r`. Records each pair's fate in
+`frags`; several shards of one read length may be scanned into the same `frags` at once,
+since they hold disjoint pairs (see `merge_scans`).
 """
 function scan_bam!(frags::Vector{LocusFrags}, ctx::ScoreContext, bam::AbstractString)
     reader = BAM.Reader(open(bam))
@@ -201,7 +203,56 @@ function scan_bam!(frags::Vector{LocusFrags}, ctx::ScoreContext, bam::AbstractSt
     end
     stats.duplicate > 0 && error("$bam: $(stats.duplicate) read pairs appear more than once or are not " *
                                  "adjacent; use the unsorted bowtie2 output (do not coordinate-sort it)")
-    return stats, bleed, sites, landings, refnames
+    return (; stats, bleed, sites, landings, refnames)
+end
+
+"""
+    bam_paths(bam_dir, L) -> Vector{String}
+
+The BAM(s) for read length `L`: `sim_L{L}.bam`, or shards `sim_L{L}_*.bam` (e.g. one per
+alignment batch). Shards may split the pairs any way as long as each pair's two mates are
+in the same shard, adjacent, as bowtie2 writes them.
+"""
+function bam_paths(bam_dir::AbstractString, L::Integer)
+    single = joinpath(bam_dir, "sim_L$L.bam")
+    prefix = "sim_L$(L)_"
+    shards = isdir(bam_dir) ? sort!([joinpath(bam_dir, f) for f in readdir(bam_dir)
+                                     if startswith(f, prefix) && endswith(f, ".bam")]) : String[]
+    if isfile(single)
+        isempty(shards) || error("$bam_dir holds both sim_L$L.bam and shards $(prefix)*.bam; keep one or the other")
+        return [single]
+    end
+    isempty(shards) && error("BAM for L=$L not found: $single (or shards $(joinpath(bam_dir, prefix))*.bam)")
+    return shards
+end
+
+"""
+    merge_scans(parts, frags, bams) -> (; stats, bleed, sites, landings, refnames)
+
+Combine the `scan_bam!` results of one read length's shards (in shard order, so the result
+does not depend on which finished first). A pair present in two shards is a duplicate even if
+both scans recorded it at once: the number of fragments with a recorded fate must equal the
+number of pairs counted.
+"""
+function merge_scans(parts, frags::Vector{LocusFrags}, bams)
+    p1 = first(parts)
+    stats = ScanStats(0, 0, 0, 0)
+    bleed, sites = copy(p1.bleed), copy(p1.sites)
+    landings = [copy(v) for v in p1.landings]
+    for (p, b) in zip(parts, bams)
+        p.refnames == p1.refnames || error("$b has a different reference sequence dictionary from $(first(bams))")
+        stats.records += p.stats.records
+        stats.pairs += p.stats.pairs
+        stats.incomplete += p.stats.incomplete
+        p === p1 && continue
+        mergewith!(+, bleed, p.bleed)
+        mergewith!(+, sites, p.sites)
+        foreach(append!, landings, p.landings)
+    end
+    seen = sum(lf -> count(s -> s != ST_MISSING && s != ST_SKIPPED, lf.status), frags; init=0)
+    seen == stats.pairs || error("$(stats.pairs - seen) read pair(s) appear in more than one of " *
+                                 "$(length(bams)) BAM shards")
+    return (; stats, bleed, sites, landings, refnames=p1.refnames)
 end
 
 pushrow!(t::NamedTuple, row::NamedTuple) = (foreach(k -> push!(t[k], row[k]), keys(t)); t)
@@ -441,7 +492,8 @@ end
 """
     score_simulation(simdir; bam_dir, out, cutoffs, tolerance=0, frag_mapq="min", fasta=nothing, read_lengths=nothing)
 
-Phase 2 scoring. Reads `bam_dir/sim_L{L}.bam` for each simulated read length and writes
+Phase 2 scoring. Reads `bam_dir/sim_L{L}.bam`, or shards `bam_dir/sim_L{L}_*.bam` (scanned
+in parallel; see `bam_paths`), for each simulated read length and writes
 `mappability.zarr` (per-base tracks, see `create_track_store`), `misplacement_summary.parquet`,
 `bleed_matrix.parquet`, `misplaced_sites.parquet` and `score.toml` to `out`.
 """
@@ -461,10 +513,7 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
     rule = get(FRAG_MAPQ_RULES, frag_mapq, nothing)
     rule === nothing && error("--frag-mapq must be one of: " * join(sort!(collect(keys(FRAG_MAPQ_RULES))), ", "))
     tolerance >= 0 || error("tolerance must be >= 0")
-    bams = Dict(L => joinpath(bam_dir, "sim_L$L.bam") for L in Ls)
-    for (L, b) in bams
-        isfile(b) || error("BAM for L=$L not found: $b")
-    end
+    bams = Dict(L => bam_paths(bam_dir, L) for L in Ls)
 
     fa = IndexedFasta(something(fasta, meta["reference"]["fasta"]))
     loci = read_loci(joinpath(simdir, "loci.tsv"))
@@ -492,47 +541,77 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
                                           "orientation" => grid["orientation"],
                                           "precision_sources" => [r.id for r in regions]))
     zlock = ReentrantLock()
+    nL, nR = length(Ls), length(regions)
+    @info "Scoring $(length(loci)) loci in $(nR) regions" read_lengths = join(Ls, ",") cutoffs = join(cutoffs, ",") bams = sum(length, values(bams)) threads = Threads.nthreads()
 
-    results = Vector{Any}(undef, length(Ls))
-    @info "Scoring $(length(loci)) loci in $(length(regions)) regions" read_lengths = join(Ls, ",") cutoffs = join(cutoffs, ",") threads = Threads.nthreads()
-    Threads.@threads :dynamic for t in eachindex(Ls)
-        L = Ls[t]
-        frags = [LocusFrags(r, seqs[k], padded[k][1], chrom_length(fa, r.chrom), L, Fs, tile_step, orients)
-                 for (k, r) in enumerate(regions)]
-        for (k, r) in enumerate(regions), (j, F) in enumerate(Fs)
+    # 1. Every simulated fragment, rebuilt from the reference and checked against tiling.tsv.
+    allfrags = [Vector{LocusFrags}(undef, nR) for _ in Ls]
+    Threads.@threads :dynamic for n in 1:nL*nR
+        t, k = divrem(n - 1, nR) .+ 1
+        L, r = Ls[t], regions[k]
+        lf = allfrags[t][k] = LocusFrags(r, seqs[k], padded[k][1], chrom_length(fa, r.chrom), L, Fs, tile_step, orients)
+        for (j, F) in enumerate(Fs)
             exp = get(tiling, (r.id, L, F), nothing)
             exp === nothing && error("tiling.tsv has no row for ($(r.id), L=$L, F=$F)")
-            lf = frags[k]
             got = (length(lf.starts[j]),
                    count(==(ST_SKIPPED), view(lf.status, lf.offsets[j]+1:lf.offsets[j+1])) ÷ length(orients))
             exp == got || error("tiling mismatch for ($(r.id), L=$L, F=$F): simulate wrote (starts, N-skipped) = " *
                                 "$exp, rescoring expects $got; was the reference changed?")
         end
-        stats, bleed, sites, landings, refnames = scan_bam!(frags, ctx, bams[L])
-        summary, bleed_tbl, sites_tbl = new_summary(), new_bleed(), new_sites()
-        totals = map(enumerate(regions)) do (k, r)
-            ns = Matrix{UInt16}(undef, length(r), length(Fs))
-            ncor = Array{UInt16}(undef, length(r), length(Fs), length(cutoffs))
-            nect = Array{UInt32}(undef, length(r), length(Fs), length(cutoffs))
-            region_tracks!(ns, ncor, nect, r, frags[k], landings[k], Fs, cutoffs)
-            tot = region_summaries!(summary, r, members[k], frags[k], landings[k], ns, L, Fs, cutoffs)
-            lock(zlock) do
-                for l in members[k]
-                    i = locus_index[l.id]
-                    rows, rr = store.offsets[i]+1:store.offsets[i+1], locus_rows(l, r)
-                    store.n_simulated[rows, :, t] = ns[rr, :]
-                    store.n_correct[rows, :, :, t] = ncor[rr, :, :]
-                    store.n_ectopic[rows, :, :, t] = nect[rr, :, :]
-                end
-            end
-            tot
-        end
-        genome_wide_rows!(summary, L, totals)
-        bleed_rows!(bleed_tbl, sites_tbl, loci, L, cutoffs, bleed, sites, refnames)
-        results[t] = (; stats, summary, bleed_tbl, sites_tbl)
-        @info "Scored L=$L" bam = bams[L] pairs = stats.pairs incomplete = stats.incomplete
     end
+
+    # 2. Scan the BAMs. Shards hold disjoint pairs, so they are scanned in parallel into the
+    #    shared fragment tables, each with its own landings/bleed/sites, merged afterwards.
+    jobs = [(t, i) for t in 1:nL for i in eachindex(bams[Ls[t]])]
+    sort!(jobs; by=((t, i),) -> -filesize(bams[Ls[t]][i]))     # largest first
+    parts = Dict{Tuple{Int,Int},Any}()
+    plock = ReentrantLock()
+    Threads.@threads :dynamic for n in eachindex(jobs)
+        t, i = jobs[n]
+        res = scan_bam!(allfrags[t], ctx, bams[Ls[t]][i])
+        lock(() -> parts[(t, i)] = res, plock)
+    end
+    scans = [merge_scans([parts[(t, i)] for i in eachindex(bams[Ls[t]])], allfrags[t], bams[Ls[t]]) for t in 1:nL]
+
+    # 3. Per-base tracks and summaries per (L, region). Zarr writes go through one lock: the
+    #    Blosc codec uses global, non-thread-safe state. Blosc's own threads speed up each chunk.
+    Blosc.set_num_threads(clamp(Threads.nthreads(), 1, Blosc.MAX_THREADS))
+    region_out = [Vector{Any}(undef, nR) for _ in Ls]
+    Threads.@threads :dynamic for n in 1:nL*nR
+        t, k = divrem(n - 1, nR) .+ 1
+        L, r, lf, landings = Ls[t], regions[k], allfrags[t][k], scans[t].landings[k]
+        ns = Matrix{UInt16}(undef, length(r), length(Fs))
+        ncor = Array{UInt16}(undef, length(r), length(Fs), length(cutoffs))
+        nect = Array{UInt32}(undef, length(r), length(Fs), length(cutoffs))
+        region_tracks!(ns, ncor, nect, r, lf, landings, Fs, cutoffs)
+        summary = new_summary()
+        tot = region_summaries!(summary, r, members[k], lf, landings, ns, L, Fs, cutoffs)
+        # Cut each member locus out before taking the lock; only the Zarr writes are serial.
+        cuts = map(members[k]) do l
+            i, rr = locus_index[l.id], locus_rows(l, r)
+            (store.offsets[i]+1:store.offsets[i+1], ns[rr, :], ncor[rr, :, :], nect[rr, :, :])
+        end
+        lock(zlock) do
+            for (rows, a, b, c) in cuts
+                store.n_simulated[rows, :, t] = a
+                store.n_correct[rows, :, :, t] = b
+                store.n_ectopic[rows, :, :, t] = c
+            end
+        end
+        region_out[t][k] = (; summary, tot)
+    end
+    Blosc.set_num_threads(1)
     Zarr.consolidate_metadata(store.group)
+
+    results = map(1:nL) do t
+        L, sc = Ls[t], scans[t]
+        summary, bleed_tbl, sites_tbl = new_summary(), new_bleed(), new_sites()
+        foreach(ro -> appendcols!(summary, ro.summary), region_out[t])
+        genome_wide_rows!(summary, L, [ro.tot for ro in region_out[t]])
+        bleed_rows!(bleed_tbl, sites_tbl, loci, L, cutoffs, sc.bleed, sc.sites, sc.refnames)
+        @info "Scored L=$L" bams = length(bams[L]) pairs = sc.stats.pairs incomplete = sc.stats.incomplete
+        (; sc.stats, summary, bleed_tbl, sites_tbl)
+    end
 
     all_summary, all_bleed, all_sites = new_summary(), new_bleed(), new_sites()
     for r in results
@@ -553,7 +632,8 @@ function score_simulation(simdir::AbstractString; bam_dir::AbstractString=joinpa
         "simulation" => Dict("dir" => abspath(simdir), "grid" => grid),
         "alignment" => Dict("settings" => isfile(align_toml) ? TOML.parsefile(align_toml) : "unknown",
                             "bowtie2_version" => isfile(version_txt) ? read(version_txt, String) : "unknown",
-                            "bams" => Dict(string(L) => abspath(b) for (L, b) in bams)),
+                            "bams" => Dict(string(L) => length(b) == 1 ? abspath(only(b)) : abspath.(b)
+                                           for (L, b) in bams)),
         "scoring" => Dict("mapq_cutoffs" => collect(Int, cutoffs), "tolerance" => tolerance,
                           "fragment_mapq_rule" => frag_mapq, "coverage" => "fragment span",
                           "site_bin" => SITE_BIN),

@@ -5,6 +5,7 @@ authors = ["Tom Wolfe"]
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
+Blosc = "a74b3585-a348-5f62-a45c-50e91977d574"
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
@@ -19,6 +20,7 @@ XAM = "d759349c-bcba-11e9-07c2-5b90f8f05f7c"
 Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
 
 [compat]
+Blosc = "0.7.3"
 GLMakie = "0.13.16"
 Zarr = "0.11.1"
 julia = "1.12"

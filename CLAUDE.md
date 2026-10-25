@@ -23,7 +23,7 @@ julia -t 8 --project -m UniMap <command> --help                   # run the CLI 
 - The `"align + score (synthetic genome)"` end-to-end testset only runs when `bowtie2`,
   `bowtie2-build` and `samtools` are on `PATH`. Otherwise it is skipped with a warning.
 - Use `-t N` with N > 1 so the threaded paths get exercised: `simulate` threads over loci and
-  `score` threads over read lengths.
+  `score` threads over BAM shards, regions and read lengths.
 
 ## Architecture
 
@@ -58,7 +58,13 @@ Invariants that span files:
 - Tracks store raw **counts** (`n_simulated`, `n_correct`, `n_ectopic`), never ratios. Derived
   quantities (`map_back`, `ectopic_rate`, `log2_ratio` with `LOG_RATIO_PSEUDOCOUNT`) are computed
   on read, in `locus_track` and in the viewer.
-- BAMs must stay in bowtie2 output order (mates adjacent). Never sort or filter them.
+- BAMs must stay in bowtie2 output order (mates adjacent). Never sort or filter them. A read
+  length's BAM may be split into shards `sim_L{L}_*.bam` (`bam_paths`); they hold disjoint
+  pairs and are scanned concurrently into the same `LocusFrags`, with per-shard
+  landings/bleed/sites combined by `merge_scans` (which also catches a pair in two shards).
+- Zarr writes go through one lock: Zarr.jl's Blosc codec calls `blosc_compress` and
+  `blosc_set_compressor`, which use Blosc's global state. Don't remove it; parallelism inside a
+  chunk comes from `Blosc.set_num_threads`.
 - `n_simulated`/`n_correct` are UInt16, so 2×max F must fit in UInt16 (checked in `score_simulation`).
 
 **Viewer** (`viewer.jl`, a submodule `UniMap.Viewer`): GLMakie is deliberately **not** loaded at

@@ -65,7 +65,7 @@ function cli_settings()
             help = "`unimap simulate` output directory"
             required = true
         "--bam-dir"
-            help = "directory containing sim_L{L}.bam (default: SIM/aln)"
+            help = "directory containing sim_L{L}.bam, or shards sim_L{L}_*.bam scanned in parallel (default: SIM/aln)"
         "--out", "-o"
             help = "output directory (default: SIM/scores)"
         "--cutoffs"

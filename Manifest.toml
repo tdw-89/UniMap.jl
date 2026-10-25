@@ -2,7 +2,7 @@
 
 julia_version = "1.13.2"
 manifest_format = "2.1"
-project_hash = "355a8f8b83e25c4ceaf1ceaf3b29363cde2a8a1a"
+project_hash = "abc7a2211f7011529f4300315f8e06c904a0c72e"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -2085,7 +2085,7 @@ uuid = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 version = "1.11.0"
 
 [[deps.UniMap]]
-deps = ["ArgParse", "CSV", "CairoMakie", "CodecZlib", "DataFrames", "Dates", "FASTX", "GLMakie", "Parquet", "SHA", "TOML", "XAM", "Zarr"]
+deps = ["ArgParse", "Blosc", "CSV", "CairoMakie", "CodecZlib", "DataFrames", "Dates", "FASTX", "GLMakie", "Parquet", "SHA", "TOML", "XAM", "Zarr"]
 path = "."
 uuid = "aa3ede93-871e-47c9-818b-a05189d0a35d"
 version = "0.1.0"

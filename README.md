@@ -236,7 +236,7 @@ the BAMs**: scoring needs the two mates of each pair next to each other.
 | option | default | |
 |---|---|---|
 | `-s/--sim` | required | `simulate` output directory |
-| `--bam-dir` | `SIM/aln` | |
+| `--bam-dir` | `SIM/aln` | holds `sim_L{L}.bam`, or shards `sim_L{L}_*.bam` |
 | `-o/--out` | `SIM/scores` | |
 | `--cutoffs` | `0,2,5,10,20,30` | fragment MAPQ cutoffs |
 | `--tolerance` | 0 | bp |
@@ -244,8 +244,18 @@ the BAMs**: scoring needs the two mates of each pair next to each other.
 | `-L/--read-lengths` | all | score a subset |
 | `-f/--fasta` | from `simulate.toml` | use if the FASTA has moved |
 
-Threads over read lengths. Denominators are rebuilt from the reference and checked against
-`tiling.tsv`, so pairs that are missing from the BAM still count against the score.
+Denominators are rebuilt from the reference and checked against `tiling.tsv`, so pairs that
+are missing from the BAM still count against the score.
+
+The BAM for a read length may come as shards, e.g. one per alignment batch when bowtie2 runs
+as many independent jobs: `sim_L{L}_001.bam`, `sim_L{L}_002.bam`, ... Shards need no
+concatenating and are scanned in parallel. Any split works as long as both mates of a pair
+are in the same shard, adjacent, as bowtie2 writes them; a pair found in two shards is an
+error. Give either `sim_L{L}.bam` or shards, not both.
+
+Threads: shard scans, fragment tables and per-region tracks all run in parallel. Writing the
+Zarr store is serial (Zarr.jl's Blosc codec uses Blosc's global state), but each chunk is
+compressed with Blosc's own threads.
 
 ### `unimap view`
 | option | default | |

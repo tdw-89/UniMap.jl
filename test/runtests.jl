@@ -356,6 +356,34 @@ if have_aligner
     g = rows(s, i -> s.locus_id[i] == "ALL")
     @test length(g) == length(Fs) * 6
 
+    # Sharded input: the same pairs split three ways (mates kept together) are scanned in
+    # parallel and score identically to the single BAM.
+    shard_dir = joinpath(dir, "shards")
+    mkpath(shard_dir)
+    bam = joinpath(sim, "aln", "sim_L50.bam")
+    hdr = read(`samtools view -H $bam`, String)
+    recs = readlines(`samtools view $bam`)
+    @test iseven(length(recs))
+    cut = round.(Int, range(0, length(recs) ÷ 2; length=4))
+    for k in 1:3
+        sam = joinpath(shard_dir, "part.sam")
+        open(io -> (print(io, hdr); foreach(r -> println(io, r), recs[2cut[k]+1:2cut[k+1]])), sam, "w")
+        run(`samtools view -b -o $(joinpath(shard_dir, "sim_L50_$k.bam")) $sam`)
+        rm(sam)
+    end
+    rs = score_simulation(sim; bam_dir=shard_dir, out=joinpath(dir, "scores_shards"))
+    zs = UniMap.Zarr.zopen(rs.tracks; consolidated=true)
+    for a in ("n_simulated", "n_correct", "n_ectopic")
+        @test zs[a][:] == z[a][:]
+    end
+    @test isequal(rs.summary, res.summary) && isequal(rs.bleed, res.bleed) && isequal(rs.sites, res.sites)
+    # a pair in two shards, and a single BAM beside shards, are both refused
+    cp(joinpath(shard_dir, "sim_L50_2.bam"), joinpath(shard_dir, "sim_L50_9.bam"))
+    @test_throws Exception score_simulation(sim; bam_dir=shard_dir, out=joinpath(dir, "scores_dup"))
+    rm(joinpath(shard_dir, "sim_L50_9.bam"))
+    cp(bam, joinpath(shard_dir, "sim_L50.bam"))
+    @test_throws ErrorException score_simulation(sim; bam_dir=shard_dir, out=joinpath(dir, "scores_both"))
+
     # single orientation + thinned tiling, without dupB in the panel and with a locus
     # overlapping dupA (merged into one simulation region)
     sim1 = joinpath(dir, "sim_minus")

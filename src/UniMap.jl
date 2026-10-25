@@ -1,6 +1,7 @@
 module UniMap
 
 using ArgParse
+import Blosc
 using CodecZlib
 using Dates
 using Parquet: write_parquet
